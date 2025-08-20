@@ -7,7 +7,7 @@ import eu.fast.gw2.jpa.Jpa;
 
 import java.util.*;
 
-public class OverlayDebug {
+public class DebugOverlay {
     private static final ObjectMapper M = new ObjectMapper();
 
     // Column constants (same as OverlayEngine)

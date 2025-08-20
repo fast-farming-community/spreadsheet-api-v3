@@ -6,6 +6,7 @@ import eu.fast.gw2.dao.CalculationsDao;
 import eu.fast.gw2.dao.Gw2PricesDao;
 import eu.fast.gw2.dao.ItemsDao;
 import eu.fast.gw2.jpa.Jpa;
+import eu.fast.gw2.main.DebugTrace;
 
 import java.util.*;
 import java.util.stream.Collectors;
@@ -14,7 +15,7 @@ public class OverlayEngine {
 
     private static final ObjectMapper M = new ObjectMapper();
 
-    // Column name variants we might see
+    // Column names (canonical)
     private static final String COL_ID = "Id";
     private static final String COL_CAT = "Category";
     private static final String COL_KEY = "Key";
@@ -23,13 +24,12 @@ public class OverlayEngine {
     private static final String COL_TPB = "TPBuyProfit";
     private static final String COL_TPS = "TPSellProfit";
     private static final String COL_TOTAL_AMOUNT = "Total Amount";
-    private static final String COL_TOTAL_AMOUNT2 = "TotalAmount";
+    private static final String COL_TOTAL_AMOUNT2 = "TotalAmount"; // seen in some sheets
 
     /**
      * Recompute one table (detail_tables) identified by (detailFeatureId,
      * tableKey).
-     * - Uses public.calculations to pick tax% and aggregation op per
-     * (category,key).
+     * Uses public.calculations to pick tax% and aggregation op per (category,key).
      */
     public static void recompute(long detailFeatureId, String tableKey) {
         // 1) Load parent table JSON
@@ -60,7 +60,7 @@ public class OverlayEngine {
             var cat = str(row.get(COL_CAT));
             var key = str(row.get(COL_KEY));
             if (isBag(cat, key)) {
-                // bag EV computed from child table later; we'll collect ids after loading drops
+                // bag EV from child table; ids will be collected after loading drops
                 continue;
             }
             if (isInternal(cat)) {
@@ -74,18 +74,42 @@ public class OverlayEngine {
         // Load base price cache for leaf ids
         Map<Integer, int[]> priceMap = Gw2PricesDao.loadLatest(needed); // id -> [buy,sell] in copper
 
+        // ---- TRACE header ----
+        int tpRows = countRowsWithTpFields(rows);
+        DebugTrace.rowHeader(detailFeatureId, tableKey, rows.size(), tpRows);
+        long sumBuy = 0, sumSell = 0;
+        int printed = 0;
+
         // 3) Recompute each row
-        for (var row : rows) {
-            var cat = str(row.get(COL_CAT));
-            var key = str(row.get(COL_KEY));
+        for (int i = 0; i < rows.size(); i++) {
+            var row = rows.get(i);
+
+            // Extract common fields (for trace & logic)
+            Integer id = toIntBoxed(row.get(COL_ID));
+            String name = str(row.get(COL_NAME));
+            String cat = str(row.get(COL_CAT));
+            String key = str(row.get(COL_KEY));
+
+            Double avg = toDoubleBoxed(row.get(COL_AVG));
+            Double total = totalAmountboxed(row); // handles 2 variants
+
+            Long tpbIn = toLongBoxed(row.get(COL_TPB));
+            Long tpsIn = toLongBoxed(row.get(COL_TPS));
+
             // pick taxes%: INTERNAL always 0, else row-specific cfg or table cfg or default
             // 15
             int taxesPercent = pickTaxesPercent(cat, key, tableCfg);
 
+            // Values for trace:
+            String sourcePath = "n/a";
+            Integer priceBuy = null, priceSell = null;
+            int taxPctUsed = taxesPercent;
+
+            Long tpbOut = null, tpsOut = null;
+
             if (isBag(cat, key)) {
                 // Compute EV from child table = the SAME key
                 List<Map<String, Object>> drops = loadDetailRows(key);
-                // add any drop ids to price map
                 var dropIds = drops.stream()
                         .map(d -> toInt(d.get(COL_ID), -1))
                         .filter(x -> x > 0)
@@ -94,54 +118,91 @@ public class OverlayEngine {
                     priceMap.putAll(Gw2PricesDao.loadLatest(dropIds));
                 }
                 int[] ev = bagEV(drops, priceMap, taxesPercent);
+                tpbOut = (long) ev[0];
+                tpsOut = (long) ev[1];
+                sourcePath = "ref(bag/" + key + ")";
+                // Optional: trace summary of the referenced table EV
+                if (DebugTrace.on() && DebugTrace.allow(id, name)) {
+                    DebugTrace.refSummary(key, "SUM", taxesPercent, tpbOut, tpsOut, drops.size());
+                }
                 writeProfit(row, ev[0], ev[1]);
-                continue;
-            }
-
-            if (isInternal(cat)) {
-                // INTERNAL: taxes forced to 0 (your rule)
+            } else if (isInternal(cat)) {
+                // INTERNAL: taxes forced to 0
+                taxPctUsed = 0;
                 var cfg = CalculationsDao.find(cat, key);
                 if (cfg != null && cfg.sourceTableKey() != null && !cfg.sourceTableKey().isBlank()) {
-                    List<Map<String, Object>> src = loadDetailRows(cfg.sourceTableKey());
+                    String refKey = cfg.sourceTableKey();
+                    List<Map<String, Object>> src = loadDetailRows(refKey);
                     var ids = src.stream().map(d -> toInt(d.get(COL_ID), -1)).filter(x -> x > 0)
                             .collect(Collectors.toSet());
                     if (!ids.isEmpty())
                         priceMap.putAll(Gw2PricesDao.loadLatest(ids));
                     int[] ev = bagEV(src, priceMap, 0); // INTERNAL derives without tax at this level
+                    tpbOut = (long) ev[0];
+                    tpsOut = (long) ev[1];
+                    sourcePath = "INTERNAL(" + refKey + ")";
+                    if (DebugTrace.on() && DebugTrace.allow(id, name)) {
+                        DebugTrace.refSummary(refKey, "SUM", 0, tpbOut, tpsOut, src.size());
+                    }
                     writeProfit(row, ev[0], ev[1]);
                 } else {
-                    writeProfit(row, 0, 0); // unknown mapping => 0
+                    tpbOut = 0L;
+                    tpsOut = 0L;
+                    sourcePath = "INTERNAL(0)";
+                    writeProfit(row, 0, 0);
                 }
-                continue;
-            }
-
-            // Leaf item (normal TP row): id > 0
-            int id = toInt(row.get(COL_ID), -1);
-            if (id > 0) {
+            } else if (id != null && id > 0) {
+                // Leaf item (normal TP row): id > 0
                 int[] ps = priceMap.getOrDefault(id, new int[] { 0, 0 });
+                priceBuy = ps[0];
+                priceSell = ps[1];
                 int buyNet = net(ps[0], taxesPercent);
                 int sellNet = net(ps[1], taxesPercent);
                 if (buyNet == 0 && sellNet == 0) {
-                    // vendor fallback if available (still apply tax per your "always net" rule)
+                    // vendor fallback if available (apply same tax rule)
                     Integer vendor = ItemsDao.vendorValueById(id);
                     if (vendor != null) {
+                        priceBuy = vendor;
+                        priceSell = vendor;
                         buyNet = net(vendor, taxesPercent);
                         sellNet = net(vendor, taxesPercent);
+                        sourcePath = "vendor(" + id + ")";
+                    } else {
+                        sourcePath = "gw2_prices(" + id + ")";
                     }
+                } else {
+                    sourcePath = "gw2_prices(" + id + ")";
                 }
+                tpbOut = (long) buyNet;
+                tpsOut = (long) sellNet;
                 writeProfit(row, buyNet, sellNet);
-                continue;
-            }
-
-            // Special "Coin" rule removed — not special:
-            // If a row has numeric Total Amount and you want TP fields to mirror it:
-            if (isCoinRow(row)) {
+            } else if (isCoinRow(row)) {
                 int amt = numericTotalAmount(row);
+                tpbOut = (long) amt;
+                tpsOut = (long) amt;
+                sourcePath = "coin(total_amount)";
                 writeProfit(row, amt, amt);
-                continue;
+            } else {
+                // unknown row, leave as-is
+                sourcePath = "n/a";
             }
 
-            // otherwise leave as-is (no overwrite)
+            sumBuy += (tpbOut == null ? 0 : tpbOut);
+            sumSell += (tpsOut == null ? 0 : tpsOut);
+
+            // ---- TRACE row ----
+            if (DebugTrace.on() && printed < DebugTrace.limit() && DebugTrace.allow(id, name)) {
+                DebugTrace.rowLine(
+                        i + 1,
+                        id, name, cat, key,
+                        avg, total,
+                        tpbIn, tpsIn,
+                        sourcePath,
+                        priceBuy, priceSell,
+                        taxPctUsed,
+                        tpbOut, tpsOut);
+                printed++;
+            }
         }
 
         // 4) Apply table-level aggregation if configured
@@ -159,6 +220,9 @@ public class OverlayEngine {
                 .setParameter("fid", detailFeatureId)
                 .setParameter("k", tableKey)
                 .executeUpdate());
+
+        // ---- TRACE totals ----
+        DebugTrace.totalLine(sumBuy, sumSell);
     }
 
     // ===== Helpers =====
@@ -211,7 +275,6 @@ public class OverlayEngine {
             return 0;
         if (taxesPercent <= 0)
             return value;
-        // round down to copper
         double f = 1.0 - (taxesPercent / 100.0);
         return (int) Math.floor(value * f);
     }
@@ -229,8 +292,10 @@ public class OverlayEngine {
             sumBuy += Math.round(avgQty * buyNet);
             sumSell += Math.round(avgQty * sellNet);
         }
-        return new int[] { (int) Math.min(sumBuy, Integer.MAX_VALUE),
-                (int) Math.min(sumSell, Integer.MAX_VALUE) };
+        return new int[] {
+                (int) Math.min(sumBuy, Integer.MAX_VALUE),
+                (int) Math.min(sumSell, Integer.MAX_VALUE)
+        };
     }
 
     private static void writeProfit(Map<String, Object> row, int buy, int sell) {
@@ -240,7 +305,6 @@ public class OverlayEngine {
     }
 
     private static void applyAggregation(List<Map<String, Object>> rows, String op) {
-        // gather all row buy/sell ints
         var buys = new ArrayList<Integer>();
         var sells = new ArrayList<Integer>();
         for (var r : rows) {
@@ -255,7 +319,7 @@ public class OverlayEngine {
             return;
 
         int aggBuy, aggSell;
-        switch (op == null ? "SUM" : op.toUpperCase()) {
+        switch ((op == null ? "SUM" : op.toUpperCase())) {
             case "AVG" -> {
                 aggBuy = avg(buys);
                 aggSell = avg(sells);
@@ -305,8 +369,6 @@ public class OverlayEngine {
     }
 
     private static boolean isCoinRow(Map<String, Object> row) {
-        // You said coin is not special; but if you want to mirror total amount
-        // specifically for "Coin" rows:
         String name = str(row.get(COL_NAME));
         return "Coin".equalsIgnoreCase(name);
     }
@@ -360,7 +422,8 @@ public class OverlayEngine {
         return parseRows(json);
     }
 
-    // small primitives
+    // tiny helpers
+
     private static String str(Object o) {
         return o == null ? null : String.valueOf(o);
     }
@@ -393,7 +456,19 @@ public class OverlayEngine {
         }
     }
 
-    private static double toDouble(Object o, double def) {
+    private static Long toLongBoxed(Object o) {
+        if (o == null)
+            return null;
+        if (o instanceof Number n)
+            return n.longValue();
+        try {
+            return (long) Math.floor(Double.parseDouble(String.valueOf(o).replace(',', '.')));
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private static Double toDouble(Object o, double def) {
         if (o == null)
             return def;
         if (o instanceof Number n)
@@ -403,5 +478,31 @@ public class OverlayEngine {
         } catch (Exception e) {
             return def;
         }
+    }
+
+    private static Double toDoubleBoxed(Object o) {
+        if (o == null)
+            return null;
+        if (o instanceof Number n)
+            return n.doubleValue();
+        try {
+            return Double.valueOf(String.valueOf(o).replace(',', '.'));
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private static Double totalAmountboxed(Map<String, Object> row) {
+        Object v = row.containsKey(COL_TOTAL_AMOUNT) ? row.get(COL_TOTAL_AMOUNT) : row.get(COL_TOTAL_AMOUNT2);
+        return toDoubleBoxed(v);
+    }
+
+    private static int countRowsWithTpFields(List<Map<String, Object>> rows) {
+        int c = 0;
+        for (var r : rows) {
+            if (r.containsKey(COL_TPB) || r.containsKey(COL_TPS))
+                c++;
+        }
+        return c;
     }
 }

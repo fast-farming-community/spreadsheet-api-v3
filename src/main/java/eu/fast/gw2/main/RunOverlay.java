@@ -23,7 +23,7 @@ public class RunOverlay {
         OverlayEngine.recompute(fid, key);
 
         // Debug
-        OverlayDebug.printStats(fid, key);
+        DebugOverlay.printStats(fid, key);
 
         System.out.println("Recompute done for fid=" + fid + " key=" + key);
     }
