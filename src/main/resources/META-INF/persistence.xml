@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<persistence xmlns="https://jakarta.ee/xml/ns/persistence" version="3.1">
+    <persistence-unit name="gw2PU" transaction-type="RESOURCE_LOCAL">
+        <provider>org.hibernate.jpa.HibernatePersistenceProvider</provider>
+        <properties>
+            <property name="hibernate.hbm2ddl.auto" value="validate"/>
+            <property name="hibernate.archive.autodetection" value="none"/>
+        </properties>
+    </persistence-unit>
+</persistence>
