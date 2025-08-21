@@ -1,23 +1,29 @@
 package eu.fast.gw2.dynamic;
 
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.stream.Collectors;
+
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+
 import eu.fast.gw2.dao.CalculationsDao;
 import eu.fast.gw2.dao.Gw2PricesDao;
 import eu.fast.gw2.dao.ItemsDao;
-import eu.fast.gw2.dao.TierPricesReadDao;
 import eu.fast.gw2.enums.Tier;
 import eu.fast.gw2.jpa.Jpa;
 import eu.fast.gw2.main.DebugTrace;
 
-import java.util.*;
-import java.util.stream.Collectors;
-
 public class OverlayEngine {
 
-    private static final ObjectMapper M = new ObjectMapper();
+    private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
 
-    // Column names (canonical)
+    // Column names (detail_tables)
     private static final String COL_ID = "Id";
     private static final String COL_CAT = "Category";
     private static final String COL_KEY = "Key";
@@ -25,224 +31,347 @@ public class OverlayEngine {
     private static final String COL_AVG = "AverageAmount";
     private static final String COL_TPB = "TPBuyProfit";
     private static final String COL_TPS = "TPSellProfit";
-    private static final String COL_TOTAL_AMOUNT = "Total Amount";
-    private static final String COL_TOTAL_AMOUNT2 = "TotalAmount"; // seen in some sheets
+    private static final String COL_TOTAL_AMOUNT = "TotalAmount";
 
-    /**
-     * Recompute one table (detail_tables) identified by (detailFeatureId,
-     * tableKey).
-     * Uses public.calculations to pick tax% and aggregation op per (category,key).
-     */
-    public static void recompute(long detailFeatureId, String tableKey) {
-        // 1) Load parent table JSON
+    // Column names (tables - main)
+    private static final String COL_TPB_HR = "TPBuyProfitHr";
+    private static final String COL_TPS_HR = "TPSellProfitHr";
+    private static final String COL_HOURS = "Duration";
+
+    public static void recomputeMain(String tableKey, Tier tier, boolean persist) {
+        // 1) load rows JSON from main tables
         String rowsJson = Jpa.tx(em -> {
-            var r = em.createNativeQuery("""
-                        SELECT rows FROM public.detail_tables
-                         WHERE detail_feature_id = :fid AND key = :k
-                    """).setParameter("fid", detailFeatureId)
-                    .setParameter("k", tableKey)
-                    .getResultList();
-            return r.isEmpty() ? null : (String) r.get(0);
+            var query = em.createNativeQuery("""
+                        SELECT rows
+                          FROM public.tables
+                         WHERE key = :k
+                         ORDER BY id DESC
+                         LIMIT 1
+                    """).setParameter("k", tableKey).getResultList();
+            return query.isEmpty() ? null : (String) query.get(0);
         });
         if (rowsJson == null || rowsJson.isBlank())
             return;
 
         List<Map<String, Object>> rows = parseRows(rowsJson);
 
-        // Determine this table's canonical category (most common non-empty)
+        // table-level config (tax/op) – same logic as detail tables
         String tableCategory = dominantCategory(rows);
-
-        // Find per-table config (taxes/op) if defined
         var tableCfg = CalculationsDao.find(tableCategory, tableKey);
 
-        // 2) Collect all item ids needed for leaf computations
+        // collect leaf ids first
         Set<Integer> needed = new HashSet<>();
         for (var row : rows) {
-            var id = toInt(row.get(COL_ID), -1);
-            var cat = str(row.get(COL_CAT));
-            var key = str(row.get(COL_KEY));
-            if (isBag(cat, key)) {
-                // bag EV from child table; ids will be collected after loading drops
+            String cat = str(row.get(COL_CAT));
+            String key = str(row.get(COL_KEY));
+            if (isCompositeRef(cat, key) || isInternal(cat))
                 continue;
-            }
-            if (isInternal(cat)) {
-                // INTERNAL handled via source_table_key or zero—no ids here
-                continue;
-            }
+            int id = toInt(row.get(COL_ID), -1);
             if (id > 0)
                 needed.add(id);
         }
 
-        // Load base price cache for leaf ids
-        // Pick tier based on user/paywall setting (wire it later; for now set default)
-        Tier tier = Tier.T60M; // default for non-registered
-        Map<Integer, int[]> priceMap = TierPricesReadDao.loadByTier(needed, tier);
+        Map<Integer, int[]> priceMap = Gw2PricesDao.loadTier(new ArrayList<>(needed), tier.columnKey());
 
-        // ---- TRACE header ----
-        int tpRows = countRowsWithTpFields(rows);
-        DebugTrace.rowHeader(detailFeatureId, tableKey, rows.size(), tpRows);
+        // optional debug header
+        if (DebugTrace.on()) {
+            DebugTrace.rowHeader(-1L, tableKey, rows.size(), rows.size());
+        }
+
         long sumBuy = 0, sumSell = 0;
         int printed = 0;
 
-        // 3) Recompute each row
+        // 2) per-row compute (qty = 1 for all)
         for (int i = 0; i < rows.size(); i++) {
             var row = rows.get(i);
-
-            // Extract common fields (for trace & logic)
-            Integer id = toIntBoxed(row.get(COL_ID));
+            Integer idIn = toIntBoxed(row.get(COL_ID));
             String name = str(row.get(COL_NAME));
             String cat = str(row.get(COL_CAT));
-            String key = str(row.get(COL_KEY));
+            String rkey = str(row.get(COL_KEY));
+            Long tpbIn = toIntBoxed(row.get(COL_TPB)) == null ? null : Long.valueOf(toIntBoxed(row.get(COL_TPB)));
+            Long tpsIn = toIntBoxed(row.get(COL_TPS)) == null ? null : Long.valueOf(toIntBoxed(row.get(COL_TPS)));
 
-            Double avg = toDoubleBoxed(row.get(COL_AVG));
-            Double total = totalAmountboxed(row); // handles 2 variants
+            int taxesPercent = pickTaxesPercent(cat, rkey, tableCfg);
+            String source = "tier:" + tier.columnKey();
+            Integer priceBuyRaw = null, priceSellRaw = null;
+            if (isInternal(cat) && rkey != null && !rkey.isBlank()) {
+                var cfg = CalculationsDao.find(cat, rkey);
+                String refKey = (cfg != null && cfg.sourceTableKey() != null && !cfg.sourceTableKey().isBlank())
+                        ? cfg.sourceTableKey()
+                        : rkey;
 
-            Long tpbIn = toLongBoxed(row.get(COL_TPB));
-            Long tpsIn = toLongBoxed(row.get(COL_TPS));
-
-            // pick taxes%: INTERNAL always 0, else row-specific cfg or table cfg or default
-            // 15
-            int taxesPercent = pickTaxesPercent(cat, key, tableCfg);
-
-            // Values for trace:
-            String sourcePath = "n/a";
-            Integer priceBuy = null, priceSell = null;
-            int taxPctUsed = taxesPercent;
-
-            Long tpbOut = null, tpsOut = null;
-
-            if (isBag(cat, key)) {
-                // Compute EV from child table = the SAME key
-                List<Map<String, Object>> drops = loadDetailRows(key);
-                var dropIds = drops.stream()
-                        .map(d -> toInt(d.get(COL_ID), -1))
-                        .filter(x -> x > 0)
+                var src = loadDetailRows(refKey);
+                var ids = src.stream().map(d -> toInt(d.get(COL_ID), -1)).filter(x -> x > 0)
                         .collect(Collectors.toSet());
-                if (!dropIds.isEmpty()) {
-                    priceMap.putAll(Gw2PricesDao.loadLatest(dropIds));
-                }
-                int[] ev = bagEV(drops, priceMap, taxesPercent);
-                tpbOut = (long) ev[0];
-                tpsOut = (long) ev[1];
-                sourcePath = "ref(bag/" + key + ")";
-                // Optional: trace summary of the referenced table EV
-                if (DebugTrace.on() && DebugTrace.allow(id, name)) {
-                    DebugTrace.refSummary(key, "SUM", taxesPercent, tpbOut, tpsOut, drops.size());
-                }
-                writeProfit(row, ev[0], ev[1]);
-            } else if (isInternal(cat)) {
-                // INTERNAL: taxes forced to 0
-                taxPctUsed = 0;
-                var cfg = CalculationsDao.find(cat, key);
-                if (cfg != null && cfg.sourceTableKey() != null && !cfg.sourceTableKey().isBlank()) {
-                    String refKey = cfg.sourceTableKey();
-                    List<Map<String, Object>> src = loadDetailRows(refKey);
-                    var ids = src.stream().map(d -> toInt(d.get(COL_ID), -1)).filter(x -> x > 0)
-                            .collect(Collectors.toSet());
-                    if (!ids.isEmpty())
-                        priceMap.putAll(Gw2PricesDao.loadLatest(ids));
-                    int[] ev = bagEV(src, priceMap, 0); // INTERNAL derives without tax at this level
-                    tpbOut = (long) ev[0];
-                    tpsOut = (long) ev[1];
-                    sourcePath = "INTERNAL(" + refKey + ")";
-                    if (DebugTrace.on() && DebugTrace.allow(id, name)) {
-                        DebugTrace.refSummary(refKey, "SUM", 0, tpbOut, tpsOut, src.size());
-                    }
-                    writeProfit(row, ev[0], ev[1]);
-                } else {
-                    tpbOut = 0L;
-                    tpsOut = 0L;
-                    sourcePath = "INTERNAL(0)";
-                    writeProfit(row, 0, 0);
-                }
-            } else if (id != null && id > 0) {
-                int[] ps = priceMap.getOrDefault(id, new int[] { 0, 0 });
-                priceBuy = ps[0];
-                priceSell = ps[1];
+                if (!ids.isEmpty())
+                    priceMap.putAll(Gw2PricesDao.loadTier(new ArrayList<>(ids), tier.columnKey()));
 
-                boolean noTpPrices = (ps[0] <= 0 && ps[1] <= 0);
-                boolean plainItemRow = isBlank(cat) && isBlank(key);
+                int[] ev = bagEV(src, priceMap, 0);
+                // main tables have no AverageAmount → qty = 1
+                writeProfitWithHour(row, ev[0], ev[1]);
 
-                if (noTpPrices && plainItemRow) {
-                    // ➜ Vendor fallback WITHOUT taxes
-                    Integer vendor = ItemsDao.vendorValueById(id);
-                    if (vendor != null) {
-                        tpbOut = (long) vendor;
-                        tpsOut = (long) vendor;
-                        sourcePath = "vendor(" + id + ")";
-                        writeProfit(row, vendor, vendor);
-                    } else {
-                        tpbOut = 0L;
-                        tpsOut = 0L;
-                        sourcePath = "gw2_prices(" + id + ")";
-                        writeProfit(row, 0, 0);
-                    }
-                } else {
-                    // Normal TP price path (taxed)
+                if (DebugTrace.on()) {
+                    DebugTrace.refSummary(refKey, "SUM", 0, ev[0], ev[1], src.size());
+                }
+
+            } else if (isCompositeRef(cat, rkey)) {
+                // compute EV from referenced detail table rows with tax rule applied
+                var drops = loadDetailRows(rkey);
+                var dropIds = drops.stream().map(d -> toInt(d.get(COL_ID), -1))
+                        .filter(x -> x > 0).collect(Collectors.toSet());
+                if (!dropIds.isEmpty())
+                    priceMap.putAll(Gw2PricesDao.loadTier(new ArrayList<>(dropIds), tier.columnKey()));
+
+                int[] ev = bagEV(drops, priceMap, taxesPercent); // qty = 1 for main tables
+                writeProfitWithHour(row, ev[0], ev[1]);
+
+                if (DebugTrace.on()) {
+                    DebugTrace.refSummary(rkey, "SUM", taxesPercent, ev[0], ev[1], drops.size());
+                }
+            } else {
+                // leaf item (Id only)
+                int id = toInt(row.get(COL_ID), -1);
+                if (id > 0) {
+                    int[] ps = priceMap.getOrDefault(id, new int[] { 0, 0 });
+                    priceBuyRaw = ps[0];
+                    priceSellRaw = ps[1];
+
                     int buyNet = net(ps[0], taxesPercent);
                     int sellNet = net(ps[1], taxesPercent);
-                    tpbOut = (long) buyNet;
-                    tpsOut = (long) sellNet;
-                    sourcePath = "gw2_prices(" + id + ")";
-                    writeProfit(row, buyNet, sellNet);
+
+                    if (buyNet == 0 && sellNet == 0) {
+                        Integer vendor = ItemsDao.vendorValueById(id);
+                        if (vendor != null) {
+                            buyNet = vendor; // vendor → NO TAX
+                            sellNet = vendor;
+                            source = "vendor";
+                        }
+                    }
+                    writeProfitWithHour(row, buyNet, sellNet);
                 }
-            } else if (isCoinRow(row)) {
-                int amt = numericTotalAmount(row);
-                tpbOut = (long) amt;
-                tpsOut = (long) amt;
-                sourcePath = "coin(total_amount)";
-                writeProfit(row, amt, amt);
-            } else {
-                // unknown row, leave as-is
-                sourcePath = "n/a";
             }
 
-            sumBuy += (tpbOut == null ? 0 : tpbOut);
-            sumSell += (tpsOut == null ? 0 : tpsOut);
+            int outBuy = toIntBoxed(row.get(COL_TPB)) == null ? 0 : toIntBoxed(row.get(COL_TPB));
+            int outSell = toIntBoxed(row.get(COL_TPS)) == null ? 0 : toIntBoxed(row.get(COL_TPS));
+            sumBuy += outBuy;
+            sumSell += outSell;
 
-            // ---- TRACE row ----
-            if (DebugTrace.on() && printed < DebugTrace.limit() && DebugTrace.allow(id, name)) {
+            if (DebugTrace.on() && printed < DebugTrace.limit()
+                    && DebugTrace.allow(idIn, name)) {
                 DebugTrace.rowLine(
-                        i + 1,
-                        id, name, cat, key,
-                        avg, total,
+                        i + 1, idIn, name, cat, rkey,
+                        null, null, // avg/total not used for main tables
                         tpbIn, tpsIn,
-                        sourcePath,
-                        priceBuy, priceSell,
-                        taxPctUsed,
-                        tpbOut, tpsOut);
+                        source, priceBuyRaw, priceSellRaw, taxesPercent,
+                        (long) outBuy, (long) outSell);
                 printed++;
             }
         }
 
-        // 4) Apply table-level aggregation if configured
         if (tableCfg != null) {
+            // keep your “TOTAL” summary logic for main tables as well
+            applyAggregation(rows, tableCfg.operation());
+        }
+        if (DebugTrace.on()) {
+            DebugTrace.totalLine(sumBuy, sumSell);
+        }
+
+        if (persist) {
+            String out = toJson(rows);
+            Jpa.txVoid(em -> em.createNativeQuery("""
+                        UPDATE public.tables
+                           SET rows = :rows, updated_at = now()
+                         WHERE key = :k
+                    """).setParameter("rows", out)
+                    .setParameter("k", tableKey)
+                    .executeUpdate());
+        }
+    }
+
+    /**
+     * Recompute one table (detail_tables) identified by (detailFeatureId,
+     * tableKey).
+     * Uses public.calculations to pick tax% and aggregation op per (category,key).
+     */
+    public static void recompute(long detailFeatureId, String tableKey, Tier tier, boolean persist) {
+        String rowsJson = Jpa.tx(em -> {
+            var query = em.createNativeQuery("""
+                        SELECT rows FROM public.detail_tables
+                         WHERE detail_feature_id = :fid AND key = :k
+                    """).setParameter("fid", detailFeatureId).setParameter("k", tableKey).getResultList();
+            return query.isEmpty() ? null : (String) query.get(0);
+        });
+        if (rowsJson == null || rowsJson.isBlank())
+            return;
+
+        List<Map<String, Object>> rows = parseRows(rowsJson);
+
+        // Table-level config (tax/op)
+        var tableCategory = dominantCategory(rows);
+        var tableCfg = CalculationsDao.find(tableCategory, tableKey);
+
+        // Collect leaf IDs (bags/internal handled later)
+        Set<Integer> needed = new HashSet<>();
+        for (var row : rows) {
+            String cat = str(row.get(COL_CAT));
+            String key = str(row.get(COL_KEY));
+            if (isCompositeRef(cat, key) || isInternal(cat))
+                continue;
+            int id = toInt(row.get(COL_ID), -1);
+            if (id > 0)
+                needed.add(id);
+        }
+
+        // Load tiered prices for leaves
+        Map<Integer, int[]> priceMap = Gw2PricesDao.loadTier(new ArrayList<>(needed), tier.columnKey());
+
+        // --- DEBUG HEADER
+        if (DebugTrace.on()) {
+            int tpRows = rows.size(); // or tighten if you prefer
+            DebugTrace.rowHeader(detailFeatureId, tableKey, rows.size(), tpRows);
+        }
+
+        long sumBuy = 0, sumSell = 0;
+        int printed = 0;
+
+        // Recompute rows
+        for (int i = 0; i < rows.size(); i++) {
+            var row = rows.get(i);
+
+            // snapshot of incoming fields (for debug print)
+            Integer idIn = toIntBoxed(row.get(COL_ID));
+            String name = str(row.get(COL_NAME));
+            String cat = str(row.get(COL_CAT));
+            String rkey = str(row.get(COL_KEY));
+            Double avg = toDouble(row.get(COL_AVG), 0.0);
+            Double total = toDouble(
+                    row.get(COL_TOTAL_AMOUNT), 0.0);
+            Long tpbIn = toIntBoxed(row.get(COL_TPB)) == null ? null : Long.valueOf(toIntBoxed(row.get(COL_TPB)));
+            Long tpsIn = toIntBoxed(row.get(COL_TPS)) == null ? null : Long.valueOf(toIntBoxed(row.get(COL_TPS)));
+
+            int taxesPercent = pickTaxesPercent(cat, rkey, tableCfg);
+            String source = "tier:" + tier.columnKey();
+            Integer priceBuyRaw = null, priceSellRaw = null;
+
+            if (isInternal(cat) && rkey != null && !rkey.isBlank()) {
+                var cfg = CalculationsDao.find(cat, rkey);
+                String refKey = (cfg != null && cfg.sourceTableKey() != null && !cfg.sourceTableKey().isBlank())
+                        ? cfg.sourceTableKey()
+                        : rkey;
+
+                var src = loadDetailRows(refKey);
+                var ids = src.stream().map(d -> toInt(d.get(COL_ID), -1)).filter(x -> x > 0)
+                        .collect(Collectors.toSet());
+                if (!ids.isEmpty())
+                    priceMap.putAll(Gw2PricesDao.loadTier(new ArrayList<>(ids), tier.columnKey()));
+
+                int[] ev = bagEV(src, priceMap, 0);
+                double qty = toDouble(row.get(COL_AVG), 1.0);
+                int outBuy = (int) Math.round(ev[0] * qty);
+                int outSell = (int) Math.round(ev[1] * qty);
+                writeProfit(row, outBuy, outSell);
+
+                if (DebugTrace.on()) {
+                    DebugTrace.refSummary(refKey, "SUM", 0, ev[0], ev[1], src.size());
+                }
+            } else if (isCompositeRef(cat, rkey)) {
+                var drops = loadDetailRows(rkey);
+                var dropIds = drops.stream().map(d -> toInt(d.get(COL_ID), -1)).filter(x -> x > 0)
+                        .collect(Collectors.toSet());
+                if (!dropIds.isEmpty())
+                    priceMap.putAll(Gw2PricesDao.loadTier(new ArrayList<>(dropIds), tier.columnKey()));
+
+                int[] ev = bagEV(drops, priceMap, taxesPercent);
+                double qty = toDouble(row.get(COL_AVG), 1.0);
+                int outBuy = (int) Math.round(ev[0] * qty);
+                int outSell = (int) Math.round(ev[1] * qty);
+                writeProfit(row, outBuy, outSell);
+
+                if (DebugTrace.on()) {
+                    DebugTrace.refSummary(rkey, "SUM", taxesPercent, ev[0], ev[1], drops.size());
+                }
+            } else {
+                int id = toInt(row.get(COL_ID), -1);
+                if (id > 0) {
+                    int[] ps = priceMap.getOrDefault(id, new int[] { 0, 0 });
+                    priceBuyRaw = ps[0];
+                    priceSellRaw = ps[1];
+
+                    int buyNet = net(ps[0], taxesPercent);
+                    int sellNet = net(ps[1], taxesPercent);
+
+                    if (buyNet == 0 && sellNet == 0) {
+                        Integer vendor = ItemsDao.vendorValueById(id);
+                        if (vendor != null) {
+                            buyNet = vendor; // NO TAX on vendor
+                            sellNet = vendor;
+                            source = "vendor";
+                        }
+                    }
+                    double qty = toDouble(row.get(COL_AVG), 1.0);
+                    int outBuy = (int) Math.round(buyNet * qty);
+                    int outSell = (int) Math.round(sellNet * qty);
+                    writeProfit(row, outBuy, outSell);
+                } else if (isCoinRow(row)) {
+                    int amt = numericTotalAmount(row);
+                    writeProfit(row, amt, amt);
+                    source = "coin-total";
+                }
+            }
+
+            int outBuy = toIntBoxed(row.get(COL_TPB)) == null ? 0 : toIntBoxed(row.get(COL_TPB));
+            int outSell = toIntBoxed(row.get(COL_TPS)) == null ? 0 : toIntBoxed(row.get(COL_TPS));
+            sumBuy += outBuy;
+            sumSell += outSell;
+
+            if (DebugTrace.on() && printed < DebugTrace.limit() && DebugTrace.allow(idIn, name)) {
+                DebugTrace.rowLine(
+                        i + 1,
+                        idIn,
+                        name,
+                        cat,
+                        rkey,
+                        avg,
+                        total,
+                        tpbIn,
+                        tpsIn,
+                        source,
+                        priceBuyRaw,
+                        priceSellRaw,
+                        taxesPercent,
+                        (long) outBuy,
+                        (long) outSell);
+                printed++;
+            }
+        }
+
+        // Optional table aggregation rule
+        if (tableCfg != null)
+
+        {
             applyAggregation(rows, tableCfg.operation());
         }
 
-        // 5) Persist
-        String out = toJson(rows);
-        Jpa.txVoid(em -> em.createNativeQuery("""
-                    UPDATE public.detail_tables
-                       SET rows = :rows, updated_at = now()
-                     WHERE detail_feature_id = :fid AND key = :k
-                """).setParameter("rows", out)
-                .setParameter("fid", detailFeatureId)
-                .setParameter("k", tableKey)
-                .executeUpdate());
+        if (DebugTrace.on()) {
+            DebugTrace.totalLine(sumBuy, sumSell);
+        }
 
-        // ---- TRACE totals ----
-        DebugTrace.totalLine(sumBuy, sumSell);
+        if (persist) {
+            String out = toJson(rows);
+            Jpa.txVoid(em -> em.createNativeQuery("""
+                        UPDATE public.detail_tables
+                           SET rows = :rows, updated_at = now()
+                         WHERE detail_feature_id = :fid AND key = :k
+                    """).setParameter("rows", out).setParameter("fid", detailFeatureId).setParameter("k", tableKey)
+                    .executeUpdate());
+        }
     }
 
     // ===== Helpers =====
 
-    private static boolean isBlank(String s) {
-        return s == null || s.trim().isEmpty();
-    }
-
-    private static boolean isBag(String category, String key) {
-        return eq(category, "bag") && key != null && !key.isBlank();
+    private static boolean isCompositeRef(String category, String key) {
+        return category != null && !category.isBlank()
+                && key != null && !key.isBlank();
     }
 
     private static boolean isInternal(String category) {
@@ -251,8 +380,8 @@ public class OverlayEngine {
 
     private static String dominantCategory(List<Map<String, Object>> rows) {
         Map<String, Integer> freq = new HashMap<>();
-        for (var r : rows) {
-            String c = str(r.get(COL_CAT));
+        for (var query : rows) {
+            String c = str(query.get(COL_CAT));
             if (c != null && !c.isBlank()) {
                 freq.merge(c.trim(), 1, Integer::sum);
             }
@@ -266,14 +395,22 @@ public class OverlayEngine {
     }
 
     private static int pickTaxesPercent(String category, String key, CalculationsDao.Config tableCfg) {
+        // INTERNAL = never tax here
         if (isInternal(category))
-            return 0; // never double tax
+            return 0;
+
+        // any row that has both Category and Key => no tax
+        if (category != null && !category.isBlank() && key != null && !key.isBlank()) {
+            return 0;
+        }
+
+        // otherwise (leaf items with empty category/key) fall back to rules/defaults
         var rowCfg = CalculationsDao.find(category, key);
         if (rowCfg != null)
             return clampPercent(rowCfg.taxes());
         if (tableCfg != null)
             return clampPercent(tableCfg.taxes());
-        return 15; // default
+        return 15; // default for plain TP leaf rows
     }
 
     private static int clampPercent(int p) {
@@ -318,52 +455,407 @@ public class OverlayEngine {
         row.put(COL_TPS, sell);
     }
 
+    private static void writeProfitWithHour(Map<String, Object> row, int buy, int sell) {
+        // write base
+        writeProfit(row, buy, sell);
+
+        // derive hours if available
+        double hours = toDouble(row.get(COL_HOURS), 0.0);
+
+        int buyHr = (hours > 0.0) ? (int) Math.floor(buy / hours) : buy;
+        int sellHr = (hours > 0.0) ? (int) Math.floor(sell / hours) : sell;
+
+        row.put(COL_TPB_HR, buyHr);
+        row.put(COL_TPS_HR, sellHr);
+    }
+
     private static void applyAggregation(List<Map<String, Object>> rows, String op) {
-        var buys = new ArrayList<Integer>();
-        var sells = new ArrayList<Integer>();
-        for (var r : rows) {
-            Integer b = toIntBoxed(r.get(COL_TPB));
-            Integer s = toIntBoxed(r.get(COL_TPS));
+        // buckets
+        var buyBase = new ArrayList<Integer>();
+        var sellBase = new ArrayList<Integer>();
+        var buyHr = new ArrayList<Integer>();
+        var sellHr = new ArrayList<Integer>();
+
+        for (var query : rows) {
+            // base profits
+            Integer b = toIntBoxed(query.get(COL_TPB));
+            Integer s = toIntBoxed(query.get(COL_TPS));
             if (b != null)
-                buys.add(b);
+                buyBase.add(b);
             if (s != null)
-                sells.add(s);
+                sellBase.add(s);
+
+            // prefer existing hourly if present
+            Integer bh = query.containsKey(COL_TPB_HR) ? toIntBoxed(query.get(COL_TPB_HR)) : null;
+            Integer sh = query.containsKey(COL_TPS_HR) ? toIntBoxed(query.get(COL_TPS_HR)) : null;
+
+            // fallback: derive hourly from base and Duration if needed
+            if (bh == null || sh == null) {
+                double hours = toDouble(query.get(COL_HOURS), 0.0);
+                if (hours > 0.0) {
+                    if (bh == null && b != null)
+                        bh = (int) Math.floor(b / hours);
+                    if (sh == null && s != null)
+                        sh = (int) Math.floor(s / hours);
+                }
+            }
+
+            if (bh != null)
+                buyHr.add(bh);
+            if (sh != null)
+                sellHr.add(sh);
         }
-        if (buys.isEmpty() && sells.isEmpty())
+
+        if (buyBase.isEmpty() && sellBase.isEmpty() && buyHr.isEmpty() && sellHr.isEmpty()) {
             return;
-
-        int aggBuy, aggSell;
-        switch ((op == null ? "SUM" : op.toUpperCase())) {
-            case "AVG" -> {
-                aggBuy = avg(buys);
-                aggSell = avg(sells);
-            }
-            case "MIN" -> {
-                aggBuy = buys.stream().min(Integer::compare).orElse(0);
-                aggSell = sells.stream().min(Integer::compare).orElse(0);
-            }
-            case "MAX" -> {
-                aggBuy = buys.stream().max(Integer::compare).orElse(0);
-                aggSell = sells.stream().max(Integer::compare).orElse(0);
-            }
-            default -> {
-                aggBuy = sum(buys);
-                aggSell = sum(sells);
-            }
         }
 
-        // upsert a TOTAL row
+        String agg = (op == null ? "SUM" : op.toUpperCase());
+        java.util.function.Function<List<Integer>, Integer> AGG = xs -> {
+            if (xs == null || xs.isEmpty())
+                return 0;
+            return switch (agg) {
+                case "AVG" -> avg(xs);
+                case "MIN" -> xs.stream().min(Integer::compare).orElse(0);
+                case "MAX" -> xs.stream().max(Integer::compare).orElse(0);
+                default -> sum(xs); // SUM
+            };
+        };
+
+        int aggBuyBase = AGG.apply(buyBase);
+        int aggSellBase = AGG.apply(sellBase);
+        Integer aggBuyHr = buyHr.isEmpty() ? null : AGG.apply(buyHr);
+        Integer aggSellHr = sellHr.isEmpty() ? null : AGG.apply(sellHr);
+
+        // upsert TOTAL row
         Map<String, Object> total = rows.stream()
-                .filter(r -> "TOTAL".equalsIgnoreCase(str(r.get(COL_KEY)))
-                        || "TOTAL".equalsIgnoreCase(str(r.get(COL_NAME))))
-                .findFirst().orElse(null);
-        if (total == null) {
-            total = new LinkedHashMap<>();
-            total.put(COL_KEY, "TOTAL");
-            total.put(COL_NAME, "TOTAL");
-            rows.add(total);
+                .filter(query -> "TOTAL".equalsIgnoreCase(str(query.get(COL_KEY)))
+                        || "TOTAL".equalsIgnoreCase(str(query.get(COL_NAME))))
+                .findFirst()
+                .orElseGet(() -> {
+                    var t = new LinkedHashMap<String, Object>();
+                    t.put(COL_KEY, "TOTAL");
+                    t.put(COL_NAME, "TOTAL");
+                    rows.add(t);
+                    return t;
+                });
+
+        // write base totals
+        total.put(COL_TPB, aggBuyBase);
+        total.put(COL_TPS, aggSellBase);
+
+        // write hourly totals if we managed to compute any
+        if (aggBuyHr != null)
+            total.put(COL_TPB_HR, aggBuyHr);
+        if (aggSellHr != null)
+            total.put(COL_TPS_HR, aggSellHr);
+    }
+
+    // DETAIL: core compute → rows
+    private static List<Map<String, Object>> recomputeDetailCore(long fid, String key, Tier tier) {
+        // this is your existing recompute(...) logic up to BEFORE writing to DB,
+        // but instead of writing, return the computed `rows`.
+        // Easiest path: copy your current recompute(...) body, remove the final UPDATE,
+        // and return `rows` at the end.
+
+        // 1) load rows JSON
+        String rowsJson = Jpa.tx(em -> {
+            var r = em.createNativeQuery("""
+                        SELECT rows FROM public.detail_tables
+                         WHERE detail_feature_id = :fid AND key = :k
+                    """).setParameter("fid", fid).setParameter("k", key).getResultList();
+            return r.isEmpty() ? null : (String) r.get(0);
+        });
+        if (rowsJson == null || rowsJson.isBlank())
+            return List.of();
+
+        List<Map<String, Object>> rows = parseRows(rowsJson);
+
+        // --- paste your current detail-table compute loop here ---
+        // re-use your existing helpers (dominantCategory, pickTaxesPercent, bagEV,
+        // writeProfit, etc.)
+        // NOTE: remove the final DB UPDATE; we’re returning rows instead.
+
+        // (BEGIN your current body)
+        var tableCategory = dominantCategory(rows);
+        var tableCfg = CalculationsDao.find(tableCategory, key);
+
+        Set<Integer> needed = new HashSet<>();
+        for (var row : rows) {
+            String cat = str(row.get(COL_CAT));
+            String rkey = str(row.get(COL_KEY));
+            if (isCompositeRef(cat, rkey) || isInternal(cat))
+                continue;
+            int id = toInt(row.get(COL_ID), -1);
+            if (id > 0)
+                needed.add(id);
         }
-        writeProfit(total, aggBuy, aggSell);
+        Map<Integer, int[]> priceMap = Gw2PricesDao.loadTier(new ArrayList<>(needed), tier.columnKey());
+
+        if (DebugTrace.on()) {
+            DebugTrace.rowHeader(fid, key, rows.size(), rows.size());
+        }
+
+        long sumBuy = 0, sumSell = 0;
+        int printed = 0;
+
+        for (int i = 0; i < rows.size(); i++) {
+            var row = rows.get(i);
+
+            Integer idIn = toIntBoxed(row.get(COL_ID));
+            String name = str(row.get(COL_NAME));
+            String cat = str(row.get(COL_CAT));
+            String rkey = str(row.get(COL_KEY));
+            Double avg = toDouble(row.get(COL_AVG), 0.0);
+            Double total = toDouble(row.get(COL_TOTAL_AMOUNT), 0.0);
+            Long tpbIn = toIntBoxed(row.get(COL_TPB)) == null ? null : Long.valueOf(toIntBoxed(row.get(COL_TPB)));
+            Long tpsIn = toIntBoxed(row.get(COL_TPS)) == null ? null : Long.valueOf(toIntBoxed(row.get(COL_TPS)));
+
+            int taxesPercent = pickTaxesPercent(cat, rkey, tableCfg);
+            String source = "tier:" + tier.columnKey();
+            Integer priceBuyRaw = null, priceSellRaw = null;
+
+            if (isCompositeRef(cat, rkey)) {
+                var drops = loadDetailRows(rkey);
+                var dropIds = drops.stream().map(d -> toInt(d.get(COL_ID), -1)).filter(x -> x > 0)
+                        .collect(Collectors.toSet());
+                if (!dropIds.isEmpty())
+                    priceMap.putAll(Gw2PricesDao.loadTier(new ArrayList<>(dropIds), tier.columnKey()));
+
+                int[] ev = bagEV(drops, priceMap, taxesPercent);
+                double qty = toDouble(row.get(COL_AVG), 1.0);
+                int outBuy = (int) Math.round(ev[0] * qty);
+                int outSell = (int) Math.round(ev[1] * qty);
+                writeProfit(row, outBuy, outSell);
+                if (DebugTrace.on())
+                    DebugTrace.refSummary(rkey, "SUM", taxesPercent, ev[0], ev[1], drops.size());
+
+            } else if (isInternal(cat) && rkey != null && !rkey.isBlank()) {
+                var cfg = CalculationsDao.find(cat, rkey);
+                String refKey = (cfg != null && cfg.sourceTableKey() != null && !cfg.sourceTableKey().isBlank())
+                        ? cfg.sourceTableKey()
+                        : rkey;
+
+                var src = loadDetailRows(refKey);
+                var ids = src.stream().map(d -> toInt(d.get(COL_ID), -1)).filter(x -> x > 0)
+                        .collect(Collectors.toSet());
+                if (!ids.isEmpty())
+                    priceMap.putAll(Gw2PricesDao.loadTier(new ArrayList<>(ids), tier.columnKey()));
+
+                int[] ev = bagEV(src, priceMap, 0);
+                double qty = toDouble(row.get(COL_AVG), 1.0);
+                int outBuy = (int) Math.round(ev[0] * qty);
+                int outSell = (int) Math.round(ev[1] * qty);
+                writeProfit(row, outBuy, outSell);
+                if (DebugTrace.on())
+                    DebugTrace.refSummary(refKey, "SUM", 0, ev[0], ev[1], src.size());
+
+            } else {
+                int id = toInt(row.get(COL_ID), -1);
+                if (id > 0) {
+                    int[] ps = priceMap.getOrDefault(id, new int[] { 0, 0 });
+                    priceBuyRaw = ps[0];
+                    priceSellRaw = ps[1];
+
+                    int buyNet = net(ps[0], taxesPercent);
+                    int sellNet = net(ps[1], taxesPercent);
+
+                    if (buyNet == 0 && sellNet == 0) {
+                        Integer vendor = ItemsDao.vendorValueById(id);
+                        if (vendor != null) {
+                            buyNet = vendor;
+                            sellNet = vendor;
+                            source = "vendor";
+                        }
+                    }
+                    double qty = toDouble(row.get(COL_AVG), 1.0);
+                    writeProfit(row, (int) Math.round(buyNet * qty), (int) Math.round(sellNet * qty));
+
+                } else if (isCoinRow(row)) {
+                    int amt = numericTotalAmount(row);
+                    writeProfit(row, amt, amt);
+                    source = "coin-total";
+                }
+            }
+
+            int outBuy = toIntBoxed(row.get(COL_TPB)) == null ? 0 : toIntBoxed(row.get(COL_TPB));
+            int outSell = toIntBoxed(row.get(COL_TPS)) == null ? 0 : toIntBoxed(row.get(COL_TPS));
+            sumBuy += outBuy;
+            sumSell += outSell;
+
+            if (DebugTrace.on() && printed < DebugTrace.limit() && DebugTrace.allow(idIn, name)) {
+                DebugTrace.rowLine(i + 1, idIn, name, cat, rkey, avg, total, tpbIn, tpsIn, source, priceBuyRaw,
+                        priceSellRaw, taxesPercent, (long) outBuy, (long) outSell);
+                printed++;
+            }
+        }
+
+        // aggregation (TOTAL row)
+        tableCategory = dominantCategory(rows);
+        tableCfg = CalculationsDao.find(tableCategory, key);
+        if (tableCfg != null)
+            applyAggregation(rows, tableCfg.operation());
+
+        if (DebugTrace.on())
+            DebugTrace.totalLine(sumBuy, sumSell);
+
+        // (END your current body)
+
+        return rows;
+    }
+
+    // DETAIL: public helpers
+    public static String recomputeDetailJson(long fid, String key, Tier tier) {
+        var rows = recomputeDetailCore(fid, key, tier);
+        return toJson(rows);
+    }
+
+    public static void recomputeDetailPersist(long fid, String key, Tier tier) {
+        var rows = recomputeDetailCore(fid, key, tier);
+        String out = toJson(rows);
+        Jpa.txVoid(em -> em.createNativeQuery("""
+                    UPDATE public.detail_tables
+                       SET rows = :rows, updated_at = now()
+                     WHERE detail_feature_id = :fid AND key = :k
+                """).setParameter("rows", out)
+                .setParameter("fid", fid)
+                .setParameter("k", key)
+                .executeUpdate());
+    }
+
+    // MAIN: core compute → rows
+    private static List<Map<String, Object>> recomputeMainCore(String key, Tier tier) {
+        String rowsJson = Jpa.tx(em -> {
+            var r = em.createNativeQuery("""
+                        SELECT rows FROM public.tables
+                         WHERE key = :k
+                         ORDER BY id DESC
+                         LIMIT 1
+                    """).setParameter("k", key).getResultList();
+            return r.isEmpty() ? null : (String) r.get(0);
+        });
+        if (rowsJson == null || rowsJson.isBlank())
+            return List.of();
+
+        List<Map<String, Object>> rows = parseRows(rowsJson);
+
+        String tableCategory = dominantCategory(rows);
+        var tableCfg = CalculationsDao.find(tableCategory, key);
+
+        Set<Integer> needed = new HashSet<>();
+        for (var row : rows) {
+            String cat = str(row.get(COL_CAT));
+            String rkey = str(row.get(COL_KEY));
+            if (isCompositeRef(cat, rkey) || isInternal(cat))
+                continue;
+            int id = toInt(row.get(COL_ID), -1);
+            if (id > 0)
+                needed.add(id);
+        }
+        Map<Integer, int[]> priceMap = Gw2PricesDao.loadTier(new ArrayList<>(needed), tier.columnKey());
+
+        if (DebugTrace.on())
+            DebugTrace.rowHeader(-1L, key, rows.size(), rows.size());
+
+        long sumBuy = 0, sumSell = 0;
+        int printed = 0;
+
+        for (int i = 0; i < rows.size(); i++) {
+            var row = rows.get(i);
+            Integer idIn = toIntBoxed(row.get(COL_ID));
+            String name = str(row.get(COL_NAME));
+            String cat = str(row.get(COL_CAT));
+            String rkey = str(row.get(COL_KEY));
+            Long tpbIn = toIntBoxed(row.get(COL_TPB)) == null ? null : Long.valueOf(toIntBoxed(row.get(COL_TPB)));
+            Long tpsIn = toIntBoxed(row.get(COL_TPS)) == null ? null : Long.valueOf(toIntBoxed(row.get(COL_TPS)));
+
+            int taxesPercent = pickTaxesPercent(cat, rkey, tableCfg);
+            String source = "tier:" + tier.columnKey();
+            Integer priceBuyRaw = null, priceSellRaw = null;
+
+            if (isCompositeRef(cat, rkey)) {
+                var drops = loadDetailRows(rkey);
+                var dropIds = drops.stream().map(d -> toInt(d.get(COL_ID), -1)).filter(x -> x > 0)
+                        .collect(Collectors.toSet());
+                if (!dropIds.isEmpty())
+                    priceMap.putAll(Gw2PricesDao.loadTier(new ArrayList<>(dropIds), tier.columnKey()));
+                int[] ev = bagEV(drops, priceMap, taxesPercent);
+                writeProfitWithHour(row, ev[0], ev[1]);
+                if (DebugTrace.on())
+                    DebugTrace.refSummary(rkey, "SUM", taxesPercent, ev[0], ev[1], drops.size());
+
+            } else if (isInternal(cat) && rkey != null && !rkey.isBlank()) {
+                var cfg = CalculationsDao.find(cat, rkey);
+                String refKey = (cfg != null && cfg.sourceTableKey() != null && !cfg.sourceTableKey().isBlank())
+                        ? cfg.sourceTableKey()
+                        : rkey;
+
+                var src = loadDetailRows(refKey);
+                var ids = src.stream().map(d -> toInt(d.get(COL_ID), -1)).filter(x -> x > 0)
+                        .collect(Collectors.toSet());
+                if (!ids.isEmpty())
+                    priceMap.putAll(Gw2PricesDao.loadTier(new ArrayList<>(ids), tier.columnKey()));
+                int[] ev = bagEV(src, priceMap, 0);
+                writeProfitWithHour(row, ev[0], ev[1]);
+                if (DebugTrace.on())
+                    DebugTrace.refSummary(refKey, "SUM", 0, ev[0], ev[1], src.size());
+
+            } else {
+                int id = toInt(row.get(COL_ID), -1);
+                if (id > 0) {
+                    int[] ps = priceMap.getOrDefault(id, new int[] { 0, 0 });
+                    priceBuyRaw = ps[0];
+                    priceSellRaw = ps[1];
+                    int buyNet = net(ps[0], taxesPercent);
+                    int sellNet = net(ps[1], taxesPercent);
+                    if (buyNet == 0 && sellNet == 0) {
+                        Integer vendor = ItemsDao.vendorValueById(id);
+                        if (vendor != null) {
+                            buyNet = vendor;
+                            sellNet = vendor;
+                            source = "vendor";
+                        }
+                    }
+                    writeProfitWithHour(row, buyNet, sellNet);
+                }
+            }
+
+            int outBuy = toIntBoxed(row.get(COL_TPB)) == null ? 0 : toIntBoxed(row.get(COL_TPB));
+            int outSell = toIntBoxed(row.get(COL_TPS)) == null ? 0 : toIntBoxed(row.get(COL_TPS));
+            sumBuy += outBuy;
+            sumSell += outSell;
+
+            if (DebugTrace.on() && printed < DebugTrace.limit() && DebugTrace.allow(idIn, name)) {
+                DebugTrace.rowLine(i + 1, idIn, name, cat, rkey, null, null, tpbIn, tpsIn, source, priceBuyRaw,
+                        priceSellRaw, taxesPercent, (long) outBuy, (long) outSell);
+                printed++;
+            }
+        }
+
+        if (tableCfg != null)
+            applyAggregation(rows, tableCfg.operation());
+        if (DebugTrace.on())
+            DebugTrace.totalLine(sumBuy, sumSell);
+
+        return rows;
+    }
+
+    // MAIN: public helpers
+    public static String recomputeMainJson(String key, Tier tier) {
+        var rows = recomputeMainCore(key, tier);
+        return toJson(rows);
+    }
+
+    public static void recomputeMainPersist(String key, Tier tier) {
+        var rows = recomputeMainCore(key, tier);
+        String out = toJson(rows);
+        Jpa.txVoid(em -> em.createNativeQuery("""
+                    UPDATE public.tables
+                       SET rows = :rows, updated_at = now()
+                     WHERE key = :k
+                """).setParameter("rows", out)
+                .setParameter("k", key)
+                .executeUpdate());
     }
 
     private static int sum(List<Integer> xs) {
@@ -388,7 +880,7 @@ public class OverlayEngine {
     }
 
     private static int numericTotalAmount(Map<String, Object> row) {
-        Object v = row.containsKey(COL_TOTAL_AMOUNT) ? row.get(COL_TOTAL_AMOUNT) : row.get(COL_TOTAL_AMOUNT2);
+        Object v = row.get(COL_TOTAL_AMOUNT);
         if (v == null)
             return 0;
         if (v instanceof Number n)
@@ -404,7 +896,7 @@ public class OverlayEngine {
 
     private static List<Map<String, Object>> parseRows(String json) {
         try {
-            return M.readValue(json, new TypeReference<List<Map<String, Object>>>() {
+            return OBJECT_MAPPER.readValue(json, new TypeReference<List<Map<String, Object>>>() {
             });
         } catch (Exception e) {
             throw new RuntimeException("Failed to parse detail_tables.rows JSON", e);
@@ -413,7 +905,7 @@ public class OverlayEngine {
 
     private static String toJson(List<Map<String, Object>> rows) {
         try {
-            return M.writeValueAsString(rows);
+            return OBJECT_MAPPER.writeValueAsString(rows);
         } catch (Exception e) {
             throw new RuntimeException(e);
         }
@@ -423,20 +915,18 @@ public class OverlayEngine {
         if (key == null || key.isBlank())
             return List.of();
         String json = Jpa.tx(em -> {
-            var r = em.createNativeQuery("""
+            var query = em.createNativeQuery("""
                         SELECT rows FROM public.detail_tables
                          WHERE key = :k
                          ORDER BY id DESC
                          LIMIT 1
                     """).setParameter("k", key).getResultList();
-            return r.isEmpty() ? null : (String) r.get(0);
+            return query.isEmpty() ? null : (String) query.get(0);
         });
         if (json == null || json.isBlank())
             return List.of();
         return parseRows(json);
     }
-
-    // tiny helpers
 
     private static String str(Object o) {
         return o == null ? null : String.valueOf(o);
@@ -470,18 +960,6 @@ public class OverlayEngine {
         }
     }
 
-    private static Long toLongBoxed(Object o) {
-        if (o == null)
-            return null;
-        if (o instanceof Number n)
-            return n.longValue();
-        try {
-            return (long) Math.floor(Double.parseDouble(String.valueOf(o).replace(',', '.')));
-        } catch (Exception e) {
-            return null;
-        }
-    }
-
     private static Double toDouble(Object o, double def) {
         if (o == null)
             return def;
@@ -492,31 +970,5 @@ public class OverlayEngine {
         } catch (Exception e) {
             return def;
         }
-    }
-
-    private static Double toDoubleBoxed(Object o) {
-        if (o == null)
-            return null;
-        if (o instanceof Number n)
-            return n.doubleValue();
-        try {
-            return Double.valueOf(String.valueOf(o).replace(',', '.'));
-        } catch (Exception e) {
-            return null;
-        }
-    }
-
-    private static Double totalAmountboxed(Map<String, Object> row) {
-        Object v = row.containsKey(COL_TOTAL_AMOUNT) ? row.get(COL_TOTAL_AMOUNT) : row.get(COL_TOTAL_AMOUNT2);
-        return toDoubleBoxed(v);
-    }
-
-    private static int countRowsWithTpFields(List<Map<String, Object>> rows) {
-        int c = 0;
-        for (var r : rows) {
-            if (r.containsKey(COL_TPB) || r.containsKey(COL_TPS))
-                c++;
-        }
-        return c;
     }
 }

@@ -1,30 +1,33 @@
 package eu.fast.gw2.main;
 
-import eu.fast.gw2.dynamic.OverlayEngine;
-import eu.fast.gw2.jpa.HibernateUtil;
-
 public class RunOverlay {
     public static void main(String[] args) {
+        long fid = Long.parseLong(arg(args, "--fid=", "12"));
+        String key = arg(args, "--key=", "branded-geodermite");
+        String tierArg = arg(args, "--tier=", "60m").toLowerCase(java.util.Locale.ROOT);
+        boolean persist = Boolean.parseBoolean(arg(args, "--persist=", "false"));
+        boolean trace = Boolean.parseBoolean(arg(args, "--trace=", "false")); // <— NEW
 
-        if (args.length < 2) {
-            System.err.println("Usage: RunOverlay <detailFeatureId> <tableKey>");
-            System.exit(2);
-        }
-        long fid = Long.parseLong(args[0]);
-        String key = args[1];
+        // allow env fallback too
+        if (!trace)
+            trace = "1".equals(System.getenv("OVERLAY_TRACE"));
 
-        System.out.println(">>> RunOverlay starting (fid=" + fid + ", key=" + key + ")");
-        System.out.println(">>> RunOverlay starting (fid=" + args[0] + ", key=" + args[1] + ")");
-        System.out.println(">>> Using HibernateUtil from: " + HibernateUtil.class.getName());
+        // enable trace globally
+        DebugTrace.enable(trace);
+        DebugTrace.limit(200); // print up to 200 rows by default
 
-        // force EMF init now so we see the bootstrap path
-        HibernateUtil.emf();
+        var tier = eu.fast.gw2.enums.Tier.parse(tierArg);
+        System.out.printf(">>> RunOverlay fid=%d key=%s tier=%s persist=%s trace=%s%n",
+                fid, key, tier.name(), persist, trace);
 
-        OverlayEngine.recompute(fid, key);
+        eu.fast.gw2.dynamic.OverlayEngine.recompute(fid, key, tier, persist);
+        System.out.println("Recompute done.");
+    }
 
-        // Debug
-        DebugOverlay.printStats(fid, key);
-
-        System.out.println("Recompute done for fid=" + fid + " key=" + key);
+    private static String arg(String[] args, String key, String def) {
+        for (String a : args)
+            if (a.startsWith(key))
+                return a.substring(key.length());
+        return def;
     }
 }

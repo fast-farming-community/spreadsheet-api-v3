@@ -15,6 +15,35 @@
   </properties>
 
   <dependencies>
+
+    <!-- Google API client core -->
+    <dependency>
+      <groupId>com.google.api-client</groupId>
+      <artifactId>google-api-client</artifactId>
+      <version>2.6.0</version>
+    </dependency>
+
+    <!-- Auth (service-account JSON via GOOGLE_APPLICATION_CREDENTIALS) -->
+    <dependency>
+      <groupId>com.google.auth</groupId>
+      <artifactId>google-auth-library-oauth2-http</artifactId>
+      <version>1.23.0</version>
+    </dependency>
+
+    <!-- HTTP client + Jackson2 binding -->
+    <dependency>
+      <groupId>com.google.http-client</groupId>
+      <artifactId>google-http-client-jackson2</artifactId>
+      <version>1.43.3</version>
+    </dependency>
+
+    <!-- Google Sheets API v4 -->
+    <dependency>
+      <groupId>com.google.apis</groupId>
+      <artifactId>google-api-services-sheets</artifactId>
+      <version>v4-rev612-1.25.0</version>
+    </dependency>
+
     <!-- PostgreSQL -->
     <dependency>
       <groupId>org.postgresql</groupId>
