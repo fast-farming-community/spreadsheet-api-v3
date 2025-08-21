@@ -8,39 +8,39 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.stream.Collectors;
 
+import eu.fast.gw2.dao.Gw2PricesDao;
 import eu.fast.gw2.dao.TierPricesDao;
 import eu.fast.gw2.enums.Tier;
-import eu.fast.gw2.gw2api.Gw2ApiClient;
-import eu.fast.gw2.jpa.Jpa;
+import eu.fast.gw2.tools.Gw2ApiClient;
+import eu.fast.gw2.tools.Jpa;
 
 public class RefreshTierPrices {
 
     public static void main(String[] args) throws Exception {
-        // tier: 5|10|20|30|60 (with or without trailing 'm')
+        // tier: 5|10|15|60 (with or without trailing 'm')
         String rawTier = arg(args, new String[] { "--tier=", "--tiers=", "-t=" }, "60");
         String tierArg = normalizeTier(rawTier);
         Tier tier = Tier.parse(tierArg);
 
-        // Overall cap for THIS run (optional). This is NOT the batch size.
-        // Omit to process all items.
+        // Overall cap for THIS run (not the batch size). Null = unlimited.
         String limStr = arg(args, new String[] { "--limit=", "-l=" }, null);
-        Integer overallCap = parseLimit(limStr); // null = unlimited
+        Integer overallCap = parseLimit(limStr);
 
-        // Optional inter-batch sleep to be gentle with the API (ms). Default 150ms.
-        int sleepMs = Integer.parseInt(
-                Optional.ofNullable(System.getenv("GW2API_SLEEP_MS")).orElse("150"));
+        // inter-batch sleep (ms)
+        int sleepMs = Integer.parseInt(Optional
+                .ofNullable(System.getenv("GW2API_SLEEP_MS"))
+                .orElse("150"));
 
-        // Hard batch size for the API (GW2 cap is 200).
-        final int BATCH = 200;
+        final int BATCH = 200; // GW2 API cap
 
         System.out.println(">>> RefreshTierPrices tier=" + tierArg +
                 " overallCap=" + (overallCap == null ? "all" : overallCap) +
                 " batch=" + BATCH + " sleepMs=" + sleepMs);
 
-        // 1) Get ALL candidate item ids (tradable first)
-        List<Integer> allIds = pickCandidateItemIds(overallCap);
+        // 1) pick only stale (or vendor-missing) items
+        List<Integer> allIds = pickStaleItemIds(tier, overallCap);
         if (allIds.isEmpty()) {
-            System.out.println("No candidate items found.");
+            System.out.println("No stale items for " + tier.name() + ". Nothing to do.");
             return;
         }
 
@@ -51,21 +51,26 @@ public class RefreshTierPrices {
             int end = Math.min(off + BATCH, total);
             List<Integer> ids = allIds.subList(off, end);
 
-            // 2) Fetch flags + prices for THIS batch
+            // 2) fetch items (flags + vendor) and prices for THIS batch
             Map<Integer, Boolean> isBound = Collections.emptyMap();
+            Map<Integer, Integer> vendor = Collections.emptyMap();
             Map<Integer, int[]> prices = Collections.emptyMap();
+
             try {
-                isBound = Gw2ApiClient.fetchAccountBoundFlags(ids); // id -> true if AccountBound
-                prices = Gw2ApiClient.fetchPrices(ids); // id -> [buy, sell]
+                var items = Gw2ApiClient.fetchItemsBatch(ids);
+                isBound = Gw2ApiClient.accountBoundMap(items);
+                vendor = Gw2ApiClient.vendorValueMap(items);
+
+                // keep your existing price fetch that returns Map<Integer,int[]>
+                prices = Gw2ApiClient.fetchPrices(ids);
             } catch (Exception e) {
                 System.err.println(
                         "Batch " + (off / BATCH + 1) + ": fetch failed (" + e.getMessage() + "). Skipping batch.");
-                // Optional: backoff a bit on error
                 Thread.sleep(Math.max(sleepMs, 500));
                 continue;
             }
 
-            // 3) Merge and enforce AccountBound = 0/0
+            // merge + enforce AccountBound => 0/0
             Map<Integer, int[]> toWrite = new HashMap<>(ids.size());
             for (Integer id : ids) {
                 int[] ps = prices.getOrDefault(id, new int[] { 0, 0 });
@@ -75,15 +80,23 @@ public class RefreshTierPrices {
                 toWrite.put(id, ps);
             }
 
-            // 4) Upsert this batch into the requested tier
+            // build activity = buys.quantity + sells.quantity (fallback 0)
+            Map<Integer, Integer> activity = new HashMap<>(ids.size());
+            for (var p : Gw2ApiClient.fetchPricesBatch(ids)) {
+                int qBuy = (p.buys() == null ? 0 : Math.max(0, p.buys().quantity()));
+                int qSell = (p.sells() == null ? 0 : Math.max(0, p.sells().quantity()));
+                activity.put(p.id(), qBuy + qSell);
+            }
+
+            // tier prices + vendor values
             try {
                 TierPricesDao.upsertTier(tier, toWrite);
+                Gw2PricesDao.upsertVendorValues(vendor);
                 written += toWrite.size();
             } catch (Exception e) {
                 System.err.println("Batch " + (off / BATCH + 1) + ": DB upsert failed (" + e.getMessage() + ").");
             }
 
-            // Progress + throttle
             System.out.printf(Locale.ROOT, "  [%d/%d] upserted into %s%n", end, total, tier.name());
 
             if (end < total && sleepMs > 0) {
@@ -97,10 +110,67 @@ public class RefreshTierPrices {
         System.out.println("Done. Wrote " + written + " rows into tier " + tier.name());
     }
 
-    /**
-     * Keep your old arg(String,String,String); add this overload to accept multiple
-     * prefixes
-     */
+    private static List<Integer> pickStaleItemIds(Tier tier, Integer overallCap) {
+        final String tsCol = "ts_" + tier.label; // ts_5m|ts_10m|ts_15m|ts_60m
+
+        final int fastMin = Integer.parseInt(tier.label.replace("m", "")); // 5,10,15,60
+        final int slowMin = 60;
+
+        final int activityThreshold = Integer.parseInt(
+                Optional.ofNullable(System.getenv("GW2_LISTINGS_THRESHOLD")).orElse("5000"));
+
+        return Jpa.tx(em -> {
+            String sql = """
+                        WITH candidates AS (
+                          SELECT i.id,
+                                 t.%1$s        AS ts_tier,
+                                 COALESCE(t.activity_last, 0) AS activity,
+                                 gp.vendor_value
+                          FROM public.items i
+                          LEFT JOIN public.gw2_prices_tiers t ON t.item_id = i.id
+                          LEFT JOIN public.gw2_prices      gp ON gp.item_id = i.id
+                          WHERE i.tradable = true
+                        )
+                        SELECT id
+                        FROM candidates
+                        WHERE
+                          -- vendor backfill
+                          vendor_value IS NULL
+                          OR
+                          -- adaptive window:
+                          (
+                            ts_tier IS NULL
+                            OR ts_tier < now() - (
+                                  CASE WHEN activity >= :thr
+                                       THEN make_interval(mins := :fast)
+                                       ELSE make_interval(mins := :slow)
+                                  END
+                              )
+                          )
+                        ORDER BY
+                          COALESCE(ts_tier, TIMESTAMP 'epoch') ASC, id ASC
+                        %2$s
+                    """.formatted(tsCol, (overallCap == null ? "" : "LIMIT :lim"));
+
+            var q = em.createNativeQuery(sql);
+            q.setParameter("thr", activityThreshold);
+            q.setParameter("fast", fastMin);
+            q.setParameter("slow", slowMin);
+            if (overallCap != null)
+                q.setParameter("lim", overallCap);
+
+            @SuppressWarnings("unchecked")
+            var rows = (List<Number>) q.getResultList();
+            System.out.printf(Locale.ROOT,
+                    "Stale(%s): picked=%d (thr=%d, fast=%dm, slow=%dm)%n",
+                    tier.label, rows.size(), activityThreshold, fastMin, slowMin);
+
+            return rows.stream().map(Number::intValue).collect(Collectors.toList());
+        });
+    }
+
+    // ---- small args/utils ----
+
     private static String arg(String[] args, String[] keys, String def) {
         for (String a : args) {
             for (String k : keys) {
@@ -111,32 +181,23 @@ public class RefreshTierPrices {
         return def;
     }
 
-    /** Accept "5", "5m", "t5m", "T5M" and normalize to "5m" etc. */
     private static String normalizeTier(String s) {
         if (s == null || s.isBlank())
             return "60m";
         String t = s.trim().toLowerCase(Locale.ROOT);
-        // strip leading 't'
         if (t.startsWith("t"))
             t = t.substring(1);
-        // ensure trailing 'm'
         if (!t.endsWith("m"))
             t = t + "m";
-        // keep only known values
-        switch (t) {
-            case "5m":
-            case "10m":
-            case "20m":
-            case "30m":
-            case "60m":
-                return t;
-            default:
+        return switch (t) {
+            case "5m", "10m", "15m", "60m" -> t;
+            default -> {
                 System.out.println("! unknown tier '" + s + "', defaulting to 60m");
-                return "60m";
-        }
+                yield "60m";
+            }
+        };
     }
 
-    /** null = unlimited; >=1 = limit */
     private static Integer parseLimit(String s) {
         if (s == null)
             return null;
@@ -149,22 +210,5 @@ public class RefreshTierPrices {
         } catch (Exception e) {
             return null;
         }
-    }
-
-    private static List<Integer> pickCandidateItemIds(Integer overallCap) {
-        return Jpa.tx(em -> {
-            String base = """
-                        SELECT id
-                        FROM public.items
-                        WHERE tradable = true
-                        ORDER BY updated_at DESC
-                    """;
-            var q = em.createNativeQuery(overallCap != null ? base + " LIMIT :lim" : base);
-            if (overallCap != null)
-                q.setParameter("lim", overallCap);
-
-            List<?> rows = q.getResultList();
-            return rows.stream().map(o -> ((Number) o).intValue()).collect(Collectors.toList());
-        });
     }
 }

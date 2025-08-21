@@ -5,10 +5,10 @@ import java.util.List;
 import java.util.Locale;
 
 import eu.fast.gw2.dao.OverlayDao;
-import eu.fast.gw2.dynamic.OverlayEngine;
 import eu.fast.gw2.enums.Tier;
-import eu.fast.gw2.google.GoogleSheetsFetcher;
-import eu.fast.gw2.jpa.Jpa;
+import eu.fast.gw2.tools.GoogleSheetsImporter;
+import eu.fast.gw2.tools.Jpa;
+import eu.fast.gw2.tools.OverlayEngine;
 
 public class PipelineRun {
 
@@ -19,17 +19,21 @@ public class PipelineRun {
         System.out.println(">>> PipelineRun (no flags) starting…");
 
         // 0) Refresh the most-frequent tier (5m) from GW2 API
-        RefreshTierPrices.main(new String[] { "--tier=5m" });
+        //RefreshTierPrices.main(new String[] { "--tier=5m" });
 
         // 1) Fetch Sheets (named ranges) → upsert into public.tables /
         // public.detail_tables
-        GoogleSheetsFetcher gs = new GoogleSheetsFetcher(SHEET_ID);
-        // TODO: drive your concrete range-to-table update here (you said: always full
-        // run; it’s fast)
+        try {
+            GoogleSheetsImporter importer = new GoogleSheetsImporter(SHEET_ID);
+            importer.runFullImport();
+        } catch (Exception e) {
+            System.err.println("! GoogleSheets import failed: " + e.getMessage());
+            // continue with seeding/recompute; next cron will retry import
+        }
 
         // 2) Seed + prune calculations
-        SeedCalculationsFromDetailTable.main(new String[] { "--force", "--op=SUM", "--taxes=15" });
-        SeedCalculationsFromDetailTable.main(new String[] { "--prune" });
+        //SeedCalculationsFromDetailTable.main(new String[] { "--force", "--op=SUM", "--taxes=0" });
+        //SeedCalculationsFromDetailTable.main(new String[] { "--prune" });
 
         // 3) Recompute overlays for ALL tiers and store in overlay tables
         List<Object[]> detailTargets = selectDetailTargets();

@@ -20,7 +20,7 @@ public class RunOverlay {
         System.out.printf(">>> RunOverlay fid=%d key=%s tier=%s persist=%s trace=%s%n",
                 fid, key, tier.name(), persist, trace);
 
-        eu.fast.gw2.dynamic.OverlayEngine.recompute(fid, key, tier, persist);
+        eu.fast.gw2.tools.OverlayEngine.recompute(fid, key, tier, persist);
         System.out.println("Recompute done.");
     }
 

@@ -1,12 +1,12 @@
 -- gw2_prices
-CREATE TABLE IF NOT EXISTS public.gw2_prices
-(
-    item_id integer NOT NULL,
-    buy integer NOT NULL,
-    sell integer NOT NULL,
-    updated_at timestamp without time zone NOT NULL DEFAULT now(),
-    ts timestamp with time zone NOT NULL DEFAULT now(),
-    CONSTRAINT gw2_prices_pkey PRIMARY KEY (item_id)
+CREATE TABLE IF NOT EXISTS public.gw2_prices (
+  item_id integer NOT NULL,
+  buy integer NOT NULL,
+  sell integer NOT NULL,
+  vendor_value integer,
+  updated_at timestamp without time zone NOT NULL DEFAULT now(),
+  ts timestamp with time zone NOT NULL DEFAULT now(),
+  CONSTRAINT gw2_prices_pkey PRIMARY KEY (item_id)
 );
 
 -- detail_tables overlays
@@ -46,3 +46,19 @@ CREATE TABLE IF NOT EXISTS public.gw2_prices_tiers (
   sell_60m INTEGER,
   ts_60m TIMESTAMPTZ
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS tables_range_uniq ON public.tables("range");
+
+CREATE UNIQUE INDEX IF NOT EXISTS detail_tables_range_uniq ON public.detail_tables("range");
+
+CREATE INDEX IF NOT EXISTS gw2_prices_vendor_idx ON public.gw2_prices (vendor_value);
+
+CREATE INDEX IF NOT EXISTS gw2_prices_tiers_item_id_idx ON public.gw2_prices_tiers(item_id);
+
+CREATE INDEX IF NOT EXISTS gw2_prices_tiers_ts_5m_idx ON public.gw2_prices_tiers(ts_5m);
+
+CREATE INDEX IF NOT EXISTS gw2_prices_tiers_ts_10m_idx ON public.gw2_prices_tiers(ts_10m);
+
+CREATE INDEX IF NOT EXISTS gw2_prices_tiers_ts_15m_idx ON public.gw2_prices_tiers(ts_15m);
+
+CREATE INDEX IF NOT EXISTS gw2_prices_tiers_ts_60m_idx ON public.gw2_prices_tiers(ts_60m);

@@ -5,7 +5,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
-import eu.fast.gw2.jpa.Jpa;
+import eu.fast.gw2.tools.Jpa;
 
 public class Gw2PricesDao {
 
@@ -14,7 +14,6 @@ public class Gw2PricesDao {
      * Returns id -> [buy, sell]. Missing rows map to [0,0].
      */
     @SuppressWarnings("unchecked")
-    // eu.fast.gw2.dao.Gw2PricesDao
     public static Map<Integer, int[]> loadTier(List<Integer> ids, String tierKey) {
         if (ids == null || ids.isEmpty())
             return Collections.emptyMap();
@@ -29,18 +28,14 @@ public class Gw2PricesDao {
                 buyCol = "buy_10m";
                 sellCol = "sell_10m";
             }
-            case "20m" -> {
-                buyCol = "buy_20m";
-                sellCol = "sell_20m";
-            }
-            case "30m" -> {
-                buyCol = "buy_30m";
-                sellCol = "sell_30m";
+            case "15m" -> {
+                buyCol = "buy_15m";
+                sellCol = "sell_15m";
             }
             default -> {
                 buyCol = "buy_60m";
                 sellCol = "sell_60m";
-            } // fallback
+            }
         }
 
         String sql = """
@@ -60,6 +55,46 @@ public class Gw2PricesDao {
         for (Integer id : ids)
             out.putIfAbsent(id, new int[] { 0, 0 });
         return out;
+    }
+
+    // Read one (used by OverlayEngine fallback)
+    public static Integer vendorValueById(int itemId) {
+        return Jpa.tx(em -> {
+            var r = em.createNativeQuery("""
+                        SELECT vendor_value FROM public.gw2_prices WHERE item_id = :id
+                    """).setParameter("id", itemId).getResultList();
+            if (r.isEmpty())
+                return null;
+            Object o = r.get(0);
+            return (o == null) ? null : ((Number) o).intValue();
+        });
+    }
+
+    // Batch upsert vendor values we just fetched
+    public static void upsertVendorValues(Map<Integer, Integer> vendorMap) {
+        if (vendorMap == null || vendorMap.isEmpty())
+            return;
+        Jpa.txVoid(em -> {
+            var sb = new StringBuilder();
+            sb.append("""
+                        INSERT INTO public.gw2_prices(item_id, buy, sell, vendor_value, updated_at, ts)
+                        VALUES
+                    """);
+            boolean first = true;
+            for (var e : vendorMap.entrySet()) {
+                if (!first)
+                    sb.append(',');
+                first = false;
+                // buy/sell placeholders keep existing values via ON CONFLICT
+                sb.append("(").append(e.getKey()).append(",0,0,").append(e.getValue()).append(",now(),now())");
+            }
+            sb.append("""
+                        ON CONFLICT (item_id) DO UPDATE
+                          SET vendor_value = EXCLUDED.vendor_value,
+                              updated_at   = now()
+                    """);
+            em.createNativeQuery(sb.toString()).executeUpdate();
+        });
     }
 
 }

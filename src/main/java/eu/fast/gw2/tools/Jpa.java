@@ -1,8 +1,9 @@
-package eu.fast.gw2.jpa;
+package eu.fast.gw2.tools;
+
+import java.util.function.Function;
 
 import jakarta.persistence.EntityManager;
 import jakarta.persistence.EntityTransaction;
-import java.util.function.Function;
 
 public class Jpa {
 

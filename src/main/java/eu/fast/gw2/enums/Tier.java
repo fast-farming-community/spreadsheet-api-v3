@@ -38,7 +38,7 @@ public enum Tier {
         return switch (this) {
             case T5M -> "5m";
             case T10M -> "10m";
-            case T15M -> "20m";
+            case T15M -> "15m";
             case T60M -> "60m";
         };
     }

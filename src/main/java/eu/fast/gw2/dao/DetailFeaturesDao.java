@@ -1,7 +1,7 @@
 package eu.fast.gw2.dao;
 
-import eu.fast.gw2.jpa.Jpa;
 import eu.fast.gw2.model.DetailFeature;
+import eu.fast.gw2.tools.Jpa;
 import jakarta.persistence.NoResultException;
 
 public class DetailFeaturesDao {

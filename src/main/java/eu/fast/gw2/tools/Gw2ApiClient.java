@@ -1,4 +1,4 @@
-package eu.fast.gw2.gw2api;
+package eu.fast.gw2.tools;
 
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.core.type.TypeReference;
@@ -78,19 +78,20 @@ public class Gw2ApiClient {
         });
     }
 
-    /** Public: fetch AccountBound flags for given IDs, chunked and merged. */
-    public static Map<Integer, Boolean> fetchAccountBoundFlags(Collection<Integer> ids) throws Exception {
-        if (ids == null || ids.isEmpty())
-            return Map.of();
-
+    public static Map<Integer, Boolean> accountBoundMap(List<Item> items) {
         Map<Integer, Boolean> out = new HashMap<>();
-        for (List<Integer> batch : chunks(ids, 200)) {
-            List<Item> items = sendWithRetry(() -> fetchItemsBatch(batch));
-            for (Item it : items) {
-                var flags = it.flags() == null ? List.<String>of() : it.flags();
-                boolean bound = flags.contains("AccountBound");
-                out.put(it.id(), bound);
-            }
+        for (Item it : items) {
+            boolean bound = it.flags() != null && it.flags().stream().anyMatch("AccountBound"::equalsIgnoreCase);
+            out.put(it.id(), bound);
+        }
+        return out;
+    }
+
+    public static Map<Integer, Integer> vendorValueMap(List<Item> items) {
+        Map<Integer, Integer> out = new HashMap<>();
+        for (Item it : items) {
+            if (it.vendor_value() != null)
+                out.put(it.id(), it.vendor_value());
         }
         return out;
     }

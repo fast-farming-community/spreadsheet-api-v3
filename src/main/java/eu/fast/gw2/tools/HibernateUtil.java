@@ -1,13 +1,16 @@
-package eu.fast.gw2.jpa;
+package eu.fast.gw2.tools;
+
+import java.util.HashMap;
+import java.util.Map;
+
+import javax.sql.DataSource;
+
+import org.hibernate.jpa.HibernatePersistenceProvider;
 
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
-import jakarta.persistence.EntityManagerFactory;
-import org.hibernate.jpa.HibernatePersistenceProvider;
 
-import javax.sql.DataSource;
-import java.util.HashMap;
-import java.util.Map;
+import jakarta.persistence.EntityManagerFactory;
 
 public final class HibernateUtil {
     private static EntityManagerFactory emf;
@@ -42,12 +45,11 @@ public final class HibernateUtil {
         hashMap.put(org.hibernate.cfg.AvailableSettings.LOADED_CLASSES, java.util.List.of(
                 eu.fast.gw2.model.About.class,
                 eu.fast.gw2.model.Contributor.class,
-                eu.fast.gw2.model.DetailFeature.class, 
+                eu.fast.gw2.model.DetailFeature.class,
                 eu.fast.gw2.model.DetailTable.class,
                 eu.fast.gw2.model.Feature.class,
                 eu.fast.gw2.model.Page.class,
                 eu.fast.gw2.model.Guide.class,
-                eu.fast.gw2.model.Item.class,
                 eu.fast.gw2.model.MetadataRow.class,
                 eu.fast.gw2.model.Role.class,
                 eu.fast.gw2.model.SchemaMigration.class,

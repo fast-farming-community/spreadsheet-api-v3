@@ -1,10 +1,9 @@
 package eu.fast.gw2.dao;
 
-import eu.fast.gw2.jpa.Jpa;
-import eu.fast.gw2.enums.Tier;
-
-import java.util.List;
 import java.util.Map;
+
+import eu.fast.gw2.enums.Tier;
+import eu.fast.gw2.tools.Jpa;
 
 public class TierPricesDao {
 
@@ -12,34 +11,66 @@ public class TierPricesDao {
         if (itemToBuySell == null || itemToBuySell.isEmpty())
             return;
 
-        // Build a VALUES list for batch upsert
-        // We keep column names strictly from the enum (no user input), so dynamic SQL
-        // is safe.
-        final String sql = ""
-                + "INSERT INTO public.gw2_prices_tiers (item_id, " + tier.colBuy + ", " + tier.colSell + ", "
-                + tier.colTs + ", updated_at)\n"
-                + "VALUES (:id, :buy, :sell, now(), now())\n"
-                + "ON CONFLICT (item_id) DO UPDATE SET\n"
-                + "  " + tier.colBuy + " = EXCLUDED." + tier.colBuy + ",\n"
-                + "  " + tier.colSell + " = EXCLUDED." + tier.colSell + ",\n"
-                + "  " + tier.colTs + " = now(),\n"
-                + "  updated_at       = now()";
+        final String buyCol = "buy_" + tier.label;
+        final String sellCol = "sell_" + tier.label;
+        final String tsCol = "ts_" + tier.label;
 
-        // Chunk to avoid too many statements in one transaction if the set is large
-        final int BATCH = 500; // statement reuse; GW2 API limit is ≤200 per call, but DB can do bigger batches
-        List<Map.Entry<Integer, int[]>> entries = itemToBuySell.entrySet().stream().toList();
+        // One canonical SQL string using the dynamic tier columns
+        final String SQL = ("""
+                    INSERT INTO public.gw2_prices_tiers (item_id, %s, %s, %s, updated_at)
+                    VALUES (:id, :b, :s, now(), now())
+                    ON CONFLICT (item_id) DO UPDATE
+                       SET %s = EXCLUDED.%s,
+                           %s = EXCLUDED.%s,
+                           %s = now(),
+                           updated_at = now()
+                """).formatted(buyCol, sellCol, tsCol,
+                buyCol, buyCol,
+                sellCol, sellCol,
+                tsCol);
 
+        final int FLUSH_BATCH = 500;
+
+        // Execute row-by-row (JPA doesn’t batch parameters by default)
         Jpa.txVoid(em -> {
-            for (int i = 0; i < entries.size(); i++) {
-                var e = entries.get(i);
-                var q = em.createNativeQuery(sql)
-                        .setParameter("id", e.getKey())
-                        .setParameter("buy", e.getValue()[0])
-                        .setParameter("sell", e.getValue()[1]);
+            var q = em.createNativeQuery(SQL);
+            int i = 0;
+            for (Map.Entry<Integer, int[]> e : itemToBuySell.entrySet()) {
+                int[] ps = e.getValue();
+                q.setParameter("id", e.getKey());
+                q.setParameter("b", (ps != null && ps.length > 0) ? ps[0] : 0);
+                q.setParameter("s", (ps != null && ps.length > 1) ? ps[1] : 0);
                 q.executeUpdate();
 
-                // Simple pacing every BATCH rows (optional)
-                if (i % BATCH == 0) {
+                if (++i % FLUSH_BATCH == 0) {
+                    em.flush();
+                    em.clear();
+                }
+            }
+        });
+    }
+
+    public static void upsertActivity(Map<Integer, Integer> activity) {
+        if (activity == null || activity.isEmpty())
+            return;
+
+        final String SQL = """
+                    INSERT INTO public.gw2_prices_tiers (item_id, activity_last, activity_ts, updated_at)
+                    VALUES (:id, :a, now(), now())
+                    ON CONFLICT (item_id) DO UPDATE
+                       SET activity_last = EXCLUDED.activity_last,
+                           activity_ts   = now(),
+                           updated_at    = now()
+                """;
+
+        Jpa.txVoid(em -> {
+            var q = em.createNativeQuery(SQL);
+            int i = 0;
+            for (var e : activity.entrySet()) {
+                q.setParameter("id", e.getKey());
+                q.setParameter("a", e.getValue());
+                q.executeUpdate();
+                if (++i % 500 == 0) {
                     em.flush();
                     em.clear();
                 }

@@ -1,6 +1,6 @@
 package eu.fast.gw2.dao;
 
-import eu.fast.gw2.jpa.Jpa;
+import eu.fast.gw2.tools.Jpa;
 
 public class CalculationsDao {
     public record Config(String category, String key, String operation, int taxes, String sourceTableKey) {

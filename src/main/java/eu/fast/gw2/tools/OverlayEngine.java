@@ -1,4 +1,4 @@
-package eu.fast.gw2.dynamic;
+package eu.fast.gw2.tools;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -14,9 +14,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 
 import eu.fast.gw2.dao.CalculationsDao;
 import eu.fast.gw2.dao.Gw2PricesDao;
-import eu.fast.gw2.dao.ItemsDao;
 import eu.fast.gw2.enums.Tier;
-import eu.fast.gw2.jpa.Jpa;
 import eu.fast.gw2.main.DebugTrace;
 
 public class OverlayEngine {
@@ -140,7 +138,7 @@ public class OverlayEngine {
                     int sellNet = net(ps[1], taxesPercent);
 
                     if (buyNet == 0 && sellNet == 0) {
-                        Integer vendor = ItemsDao.vendorValueById(id);
+                        Integer vendor = Gw2PricesDao.vendorValueById(id);
                         if (vendor != null) {
                             buyNet = vendor; // vendor → NO TAX
                             sellNet = vendor;
@@ -301,7 +299,7 @@ public class OverlayEngine {
                     int sellNet = net(ps[1], taxesPercent);
 
                     if (buyNet == 0 && sellNet == 0) {
-                        Integer vendor = ItemsDao.vendorValueById(id);
+                        Integer vendor = Gw2PricesDao.vendorValueById(id);
                         if (vendor != null) {
                             buyNet = vendor; // NO TAX on vendor
                             sellNet = vendor;
@@ -661,7 +659,7 @@ public class OverlayEngine {
                     int sellNet = net(ps[1], taxesPercent);
 
                     if (buyNet == 0 && sellNet == 0) {
-                        Integer vendor = ItemsDao.vendorValueById(id);
+                        Integer vendor = Gw2PricesDao.vendorValueById(id);
                         if (vendor != null) {
                             buyNet = vendor;
                             sellNet = vendor;
@@ -809,7 +807,7 @@ public class OverlayEngine {
                     int buyNet = net(ps[0], taxesPercent);
                     int sellNet = net(ps[1], taxesPercent);
                     if (buyNet == 0 && sellNet == 0) {
-                        Integer vendor = ItemsDao.vendorValueById(id);
+                        Integer vendor = Gw2PricesDao.vendorValueById(id);
                         if (vendor != null) {
                             buyNet = vendor;
                             sellNet = vendor;

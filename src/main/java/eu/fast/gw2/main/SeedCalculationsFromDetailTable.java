@@ -11,7 +11,7 @@ import java.util.stream.Collectors;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
-import eu.fast.gw2.jpa.Jpa;
+import eu.fast.gw2.tools.Jpa;
 
 public class SeedCalculationsFromDetailTable {
 
