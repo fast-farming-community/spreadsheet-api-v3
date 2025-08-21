@@ -38,22 +38,8 @@ public class GoogleSheetsImporter {
     private static final int CONNECT_TIMEOUT_MS = 10_000;
     private static final int READ_TIMEOUT_MS = 300_000;
     private static final int MAX_RETRIES = 5;
-    private static final int RANGES_CHUNK_SIZE = 60;
-
-    private static synchronized void increment(int[] box) {
-        box[0]++;
-    }
-
-    private static synchronized void add(int[] box, int n) {
-        box[0] += n;
-    }
-
-    private static String sheetOf(String a1) {
-        int bang = a1.indexOf('!');
-        if (bang <= 0)
-            return ""; // unknown sheet -> sort first
-        return a1.substring(0, bang);
-    }
+    private static final int RANGES_CHUNK_SIZE = 80;
+    private static final int THREADS = 6;
 
     // used only to hint number parsing when a value is actually present
     private static final Set<String> NUMERIC_HEADERS = new LinkedHashSet<>(Arrays.asList(
@@ -117,7 +103,7 @@ public class GoogleSheetsImporter {
 
         var chunks = partition(names, RANGES_CHUNK_SIZE);
 
-        int threads = Math.min(4, Math.max(1, Runtime.getRuntime().availableProcessors() / 2));
+        int threads = Math.min(THREADS, Math.max(1, Runtime.getRuntime().availableProcessors() / 2));
         ExecutorService pool = Executors.newFixedThreadPool(threads);
 
         // Shared counters
@@ -227,8 +213,6 @@ public class GoogleSheetsImporter {
                         add(updMain, nMain);
                         continue;
                     }
-
-                    insertMainByRange(namedRange, json);
                     increment(insMain);
                 }
             }));
@@ -249,16 +233,22 @@ public class GoogleSheetsImporter {
                 updDetail[0], updMain[0], insMain[0], skipped[0]);
     }
 
-    // ---------- DB helpers ----------
-
-    private static <T> List<List<T>> partition(List<T> src, int size) {
-        List<List<T>> out = new ArrayList<>((src.size() + size - 1) / size);
-        for (int i = 0; i < src.size(); i += size) {
-            out.add(src.subList(i, Math.min(i + size, src.size())));
-        }
-        return out;
+    private static synchronized void increment(int[] box) {
+        box[0]++;
     }
 
+    private static synchronized void add(int[] box, int n) {
+        box[0] += n;
+    }
+
+    private static String sheetOf(String a1) {
+        int bang = a1.indexOf('!');
+        if (bang <= 0)
+            return ""; // unknown sheet -> sort first
+        return a1.substring(0, bang);
+    }
+
+    // ---------- DB helpers ----------
     private List<String> loadRangesFromDb() {
         return Jpa.tx(em -> {
             var ranges = new LinkedHashSet<String>();
@@ -335,10 +325,12 @@ public class GoogleSheetsImporter {
                 """).setParameter("rows", jsonRows).setParameter("r", range).executeUpdate());
     }
 
-    private void insertMainByRange(String range, String jsonRows) {
-        Jpa.txVoid(em -> em.createNativeQuery("""
-                    INSERT INTO public.tables("range", rows, inserted_at, updated_at)
-                    VALUES (:r, :rows, now(), now())
-                """).setParameter("r", range).setParameter("rows", jsonRows).executeUpdate());
+    private static <T> List<List<T>> partition(List<T> src, int size) {
+        List<List<T>> out = new ArrayList<>((src.size() + size - 1) / size);
+        for (int i = 0; i < src.size(); i += size) {
+            out.add(src.subList(i, Math.min(i + size, src.size())));
+        }
+        return out;
     }
+
 }
