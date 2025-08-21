@@ -30,4 +30,24 @@ public class Gw2PricesDao {
             return out;
         });
     }
+
+    public static void insertIfChanged(int itemId, int buy, int sell) {
+        Jpa.txVoid(em -> em.createNativeQuery("""
+                    WITH last AS (
+                      SELECT buy, sell
+                      FROM public.gw2_prices
+                      WHERE item_id = :id
+                      ORDER BY ts DESC
+                      LIMIT 1
+                    )
+                    INSERT INTO public.gw2_prices(item_id, buy, sell)
+                    SELECT :id, :b, :s
+                    WHERE NOT EXISTS (
+                      SELECT 1 FROM last WHERE buy = :b AND sell = :s
+                    )
+                """).setParameter("id", itemId)
+                .setParameter("b", buy)
+                .setParameter("s", sell)
+                .executeUpdate());
+    }
 }

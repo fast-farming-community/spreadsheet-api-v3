@@ -66,3 +66,17 @@ INSERT INTO public.gw2_prices(item_id, buy, sell)
 VALUES (84084, 164107, 173225)
 ON CONFLICT (item_id) DO UPDATE
 SET buy = EXCLUDED.buy, sell = EXCLUDED.sell, updated_at = NOW();
+
+-- 1) Add the missing timestamp column
+ALTER TABLE public.gw2_prices
+  ADD COLUMN IF NOT EXISTS ts timestamptz;
+
+-- 2) Backfill NULLs (if any) and enforce constraints
+UPDATE public.gw2_prices SET ts = now() WHERE ts IS NULL;
+ALTER TABLE public.gw2_prices ALTER COLUMN ts SET DEFAULT now();
+ALTER TABLE public.gw2_prices ALTER COLUMN ts SET NOT NULL;
+
+-- 3) Ensure the correct composite index exists (drop old, recreate proper)
+DROP INDEX IF EXISTS gw2_prices_item_ts_idx;
+CREATE INDEX gw2_prices_item_ts_idx
+  ON public.gw2_prices (item_id, ts DESC);

@@ -5,6 +5,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import eu.fast.gw2.dao.CalculationsDao;
 import eu.fast.gw2.dao.Gw2PricesDao;
 import eu.fast.gw2.dao.ItemsDao;
+import eu.fast.gw2.dao.TierPricesReadDao;
+import eu.fast.gw2.enums.Tier;
 import eu.fast.gw2.jpa.Jpa;
 import eu.fast.gw2.main.DebugTrace;
 
@@ -72,7 +74,9 @@ public class OverlayEngine {
         }
 
         // Load base price cache for leaf ids
-        Map<Integer, int[]> priceMap = Gw2PricesDao.loadLatest(needed); // id -> [buy,sell] in copper
+        // Pick tier based on user/paywall setting (wire it later; for now set default)
+        Tier tier = Tier.T60M; // default for non-registered
+        Map<Integer, int[]> priceMap = TierPricesReadDao.loadByTier(needed, tier);
 
         // ---- TRACE header ----
         int tpRows = countRowsWithTpFields(rows);
@@ -152,30 +156,36 @@ public class OverlayEngine {
                     writeProfit(row, 0, 0);
                 }
             } else if (id != null && id > 0) {
-                // Leaf item (normal TP row): id > 0
                 int[] ps = priceMap.getOrDefault(id, new int[] { 0, 0 });
                 priceBuy = ps[0];
                 priceSell = ps[1];
-                int buyNet = net(ps[0], taxesPercent);
-                int sellNet = net(ps[1], taxesPercent);
-                if (buyNet == 0 && sellNet == 0) {
-                    // vendor fallback if available (apply same tax rule)
+
+                boolean noTpPrices = (ps[0] <= 0 && ps[1] <= 0);
+                boolean plainItemRow = isBlank(cat) && isBlank(key);
+
+                if (noTpPrices && plainItemRow) {
+                    // ➜ Vendor fallback WITHOUT taxes
                     Integer vendor = ItemsDao.vendorValueById(id);
                     if (vendor != null) {
-                        priceBuy = vendor;
-                        priceSell = vendor;
-                        buyNet = net(vendor, taxesPercent);
-                        sellNet = net(vendor, taxesPercent);
+                        tpbOut = (long) vendor;
+                        tpsOut = (long) vendor;
                         sourcePath = "vendor(" + id + ")";
+                        writeProfit(row, vendor, vendor);
                     } else {
+                        tpbOut = 0L;
+                        tpsOut = 0L;
                         sourcePath = "gw2_prices(" + id + ")";
+                        writeProfit(row, 0, 0);
                     }
                 } else {
+                    // Normal TP price path (taxed)
+                    int buyNet = net(ps[0], taxesPercent);
+                    int sellNet = net(ps[1], taxesPercent);
+                    tpbOut = (long) buyNet;
+                    tpsOut = (long) sellNet;
                     sourcePath = "gw2_prices(" + id + ")";
+                    writeProfit(row, buyNet, sellNet);
                 }
-                tpbOut = (long) buyNet;
-                tpsOut = (long) sellNet;
-                writeProfit(row, buyNet, sellNet);
             } else if (isCoinRow(row)) {
                 int amt = numericTotalAmount(row);
                 tpbOut = (long) amt;
@@ -226,6 +236,10 @@ public class OverlayEngine {
     }
 
     // ===== Helpers =====
+
+    private static boolean isBlank(String s) {
+        return s == null || s.trim().isEmpty();
+    }
 
     private static boolean isBag(String category, String key) {
         return eq(category, "bag") && key != null && !key.isBlank();
