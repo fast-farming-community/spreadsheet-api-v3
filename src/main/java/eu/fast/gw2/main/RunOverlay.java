@@ -1,5 +1,7 @@
 package eu.fast.gw2.main;
 
+import eu.fast.gw2.tools.DebugTrace;
+
 public class RunOverlay {
     public static void main(String[] args) {
         long fid = Long.parseLong(arg(args, "--fid=", "12"));

@@ -13,7 +13,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 
 import eu.fast.gw2.tools.Jpa;
 
-public class SeedCalculationsFromDetailTable {
+public class RunSeedCalculationsFromDetailTable {
 
     private static final String COL_CAT = "Category";
     private static final String COL_KEY = "Key";

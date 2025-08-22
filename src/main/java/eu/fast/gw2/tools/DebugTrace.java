@@ -1,5 +1,5 @@
 // eu.fast.gw2.util.DebugTrace
-package eu.fast.gw2.main;
+package eu.fast.gw2.tools;
 
 import java.util.regex.Pattern;
 

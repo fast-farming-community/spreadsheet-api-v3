@@ -14,7 +14,7 @@ import eu.fast.gw2.enums.Tier;
 import eu.fast.gw2.tools.Gw2ApiClient;
 import eu.fast.gw2.tools.Jpa;
 
-public class RefreshTierPrices {
+public class RunRefreshTierPrices {
 
     public static void main(String[] args) throws Exception {
         // tier: 5|10|15|60 (with or without trailing 'm')

@@ -15,7 +15,6 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import eu.fast.gw2.dao.CalculationsDao;
 import eu.fast.gw2.dao.Gw2PricesDao;
 import eu.fast.gw2.enums.Tier;
-import eu.fast.gw2.main.DebugTrace;
 
 public class OverlayEngine {
 

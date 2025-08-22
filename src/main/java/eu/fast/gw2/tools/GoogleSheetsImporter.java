@@ -3,6 +3,7 @@ package eu.fast.gw2.tools;
 import java.io.FileInputStream;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -13,7 +14,7 @@ import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
-import java.util.stream.Collectors;
+import java.util.regex.Pattern;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.api.client.googleapis.javanet.GoogleNetHttpTransport;
@@ -21,6 +22,7 @@ import com.google.api.client.http.HttpBackOffIOExceptionHandler;
 import com.google.api.client.http.HttpBackOffUnsuccessfulResponseHandler;
 import com.google.api.client.http.HttpRequest;
 import com.google.api.client.http.HttpRequestInitializer;
+import com.google.api.client.json.jackson2.JacksonFactory;
 import com.google.api.client.util.ExponentialBackOff;
 import com.google.api.services.sheets.v4.Sheets;
 import com.google.api.services.sheets.v4.SheetsScopes;
@@ -46,6 +48,10 @@ public class GoogleSheetsImporter {
             "Id", "AverageAmount", "TotalAmount", "TPBuyProfit", "TPSellProfit",
             "TPBuyProfitHr", "TPSellProfitHr", "Duration", "Price", "Buy", "Sell",
             "BuyPrice", "SellPrice", "Quantity", "Amount"));
+
+    // Precompiled patterns to avoid re-compilation on hot paths
+    private static final Pattern NON_ALNUM = Pattern.compile("[^A-Za-z0-9]");
+    private static final Pattern TRAILING_NUM_SUFFIX = Pattern.compile("_(\\d+)$");
 
     public GoogleSheetsImporter(String spreadsheetId) throws Exception {
         this.spreadsheetId = spreadsheetId;
@@ -81,7 +87,7 @@ public class GoogleSheetsImporter {
 
         return new Sheets.Builder(
                 transport,
-                com.google.api.client.json.jackson2.JacksonFactory.getDefaultInstance(),
+                JacksonFactory.getDefaultInstance(),
                 withTimeoutsAndBackoff).setApplicationName("fast-gw2").build();
     }
 
@@ -126,7 +132,7 @@ public class GoogleSheetsImporter {
                             .batchGet(spreadsheetId)
                             .setRanges(chunk)
                             .setValueRenderOption("UNFORMATTED_VALUE")
-                            .setDateTimeRenderOption("SERIAL_NUMBER")
+                            .setDateTimeRenderOption("FORMATTED_STRING")
                             .setFields("valueRanges(range,values)")
                             .execute();
                 } catch (Exception e) {
@@ -138,11 +144,10 @@ public class GoogleSheetsImporter {
                 System.out.printf(Locale.ROOT, " ← API returned for chunk #%d in %.1f s%n",
                         chunkIndex, (t1 - t0) / 1000.0);
 
-                List<ValueRange> vrs = Optional.ofNullable(batch.getValueRanges()).orElse(List.of());
+                List<ValueRange> vrs = Optional.ofNullable(batch.getValueRanges()).orElse(Collections.emptyList());
 
                 for (int i = 0; i < chunk.size(); i++) {
                     String namedRange = chunk.get(i);
-                    System.out.println("   Processing range: " + namedRange);
                     ValueRange vr = (i < vrs.size()) ? vrs.get(i) : null;
 
                     if (vr == null) {
@@ -165,9 +170,15 @@ public class GoogleSheetsImporter {
                         continue;
                     }
 
-                    List<String> headers = headerRow.stream()
-                            .map(o -> String.valueOf(o == null ? "" : o).trim())
-                            .collect(Collectors.toList());
+                    // Build normalized headers in a single pass; duplicates allowed (last-wins per
+                    // row)
+                    final int hdrSize = headerRow.size();
+                    List<String> headers = new ArrayList<>(hdrSize);
+                    for (int k = 0; k < hdrSize; k++) {
+                        Object cell = headerRow.get(k);
+                        String raw = String.valueOf(cell == null ? "" : cell).trim();
+                        headers.add(normalizeHeader(raw));
+                    }
 
                     List<Map<String, Object>> shaped = new ArrayList<>();
                     for (int r = 1; r < grid.size(); r++) {
@@ -182,8 +193,20 @@ public class GoogleSheetsImporter {
                             Object v = row.get(c);
                             if (v == null)
                                 continue;
-                            if (isNumericHeader(h)) {
-                                Number n = tryParseNumber(v);
+
+                            // compute base once and reuse for detection + parsing
+                            String base = baseHeader(h);
+
+                            // SPECIAL CASE: Duration / Notes as Google day fraction -> hh:mm:ss
+                            if (("Duration".equals(base) || "Notes".equals(base)) && isPureNumber(v)) {
+                                Double df = asDouble(v);
+                                obj.put(h, (df != null) ? dayFractionToHms(df) : v);
+                                continue;
+                            }
+
+                            // numeric hinting
+                            if (isNumericHeaderBase(base)) {
+                                Number n = tryParseNumber(v, base);
                                 obj.put(h, n != null ? n : v);
                             } else {
                                 obj.put(h, v);
@@ -231,6 +254,14 @@ public class GoogleSheetsImporter {
         System.out.printf(Locale.ROOT,
                 "Sheets import done: detail=%d | main=%d | inserted=%d | skipped=%d%n",
                 updDetail[0], updMain[0], insMain[0], skipped[0]);
+    }
+
+    // TEMP: mimic legacy header normalization (strip non-alphanumerics).
+    // Remove when both sides accept dots/spaces and you migrate prod.
+    private static String normalizeHeader(String h) {
+        if (h == null)
+            return "";
+        return NON_ALNUM.matcher(h.trim()).replaceAll(""); // removes spaces, dots, etc.
     }
 
     private static synchronized void increment(int[] box) {
@@ -281,25 +312,37 @@ public class GoogleSheetsImporter {
     }
 
     // ---------- numeric hinting (no placeholders) ----------
-    private static boolean isNumericHeader(String h) {
-        if (h == null)
+    private static boolean isNumericHeaderBase(String k) {
+        if (k == null)
             return false;
-        String k = h.trim();
-        if (NUMERIC_HEADERS.contains(k))
+        String key = k.trim();
+        if (NUMERIC_HEADERS.contains(key))
             return true;
-        String lower = k.toLowerCase(Locale.ROOT);
+        String lower = key.toLowerCase(Locale.ROOT);
         return lower.endsWith("amount") || lower.endsWith("price") || lower.endsWith("profit")
                 || lower.equals("buy") || lower.equals("sell") || lower.equals("duration")
                 || lower.equals("qty") || lower.equals("quantity");
     }
 
-    private static Number tryParseNumber(Object v) {
-        if (v instanceof Number n)
+    private static Number tryParseNumber(Object v, String header) {
+        if (v instanceof Number n) {
+            // Special case: Id should never be decimal
+            if ("Id".equalsIgnoreCase(header)) {
+                return n.longValue();
+            }
             return n;
+        }
         try {
             String s = String.valueOf(v).trim().replace(',', '.');
             if (s.isEmpty())
                 return null;
+
+            // If header is Id, force integer
+            if ("Id".equalsIgnoreCase(header)) {
+                double d = Double.parseDouble(s);
+                return (long) d;
+            }
+
             if (s.matches("^-?\\d+$"))
                 return Integer.parseInt(s);
             return Double.parseDouble(s);
@@ -331,6 +374,44 @@ public class GoogleSheetsImporter {
             out.add(src.subList(i, Math.min(i + size, src.size())));
         }
         return out;
+    }
+
+    private static String baseHeader(String h) {
+        if (h == null)
+            return "";
+        return TRAILING_NUM_SUFFIX.matcher(h).replaceAll("");
+    }
+
+    private static boolean isPureNumber(Object v) {
+        if (v instanceof Number)
+            return true;
+        if (v == null)
+            return false;
+        String s = String.valueOf(v).trim().replace(',', '.');
+        return s.matches("^-?\\d+(\\.\\d+)?$");
+    }
+
+    private static Double asDouble(Object v) {
+        if (v instanceof Number n)
+            return n.doubleValue();
+        if (v == null)
+            return null;
+        try {
+            String s = String.valueOf(v).trim().replace(',', '.');
+            if (s.isEmpty())
+                return null;
+            return Double.parseDouble(s);
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private static String dayFractionToHms(double df) {
+        long totalSeconds = Math.round(df * 86400.0); // 24*60*60
+        long h = totalSeconds / 3600;
+        long m = (totalSeconds % 3600) / 60;
+        long s = (totalSeconds % 60);
+        return String.format(Locale.ROOT, "%02d:%02d:%02d", h, m, s);
     }
 
 }

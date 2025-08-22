@@ -10,7 +10,7 @@ import eu.fast.gw2.tools.GoogleSheetsImporter;
 import eu.fast.gw2.tools.Jpa;
 import eu.fast.gw2.tools.OverlayEngine;
 
-public class PipelineRun {
+public class RunPipeline {
 
     private static final String SHEET_ID = "1WdwWxyP9zeJhcxoQAr-paMX47IuK6l5rqAPYDOA8mho";
     private static final int SLEEP_MS = 150;
