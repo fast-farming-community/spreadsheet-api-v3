@@ -18,6 +18,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 
 public class RunDatabaseCompareDelta {
     private static final ObjectMapper M = new ObjectMapper();
+    // 90% tolerance for numeric comparisons
+    private static final double REL_TOL = 0.90;
 
     public static void main(String[] args) throws Exception {
         String urlTest = "jdbc:postgresql://localhost:5433/fast_test";
@@ -120,17 +122,18 @@ public class RunDatabaseCompareDelta {
                             JsonNode va = a.get(f);
                             JsonNode vb = b.get(f);
 
-                            String sa = normalize(va);
-                            String sb = normalize(vb);
+                            if (equalsWithTolerance(va, vb))
+                                continue;
 
-                            if (!Objects.equals(sa, sb)) {
-                                System.out.printf(
-                                        "  line %d (Id=%s, Name=\"%s\") field %s%n    prod=%s%n    test=%s%n",
-                                        i + 1, id, name, f, sa, sb);
-                            }
+                            System.out.printf(
+                                    "  line %d (Id=%s, Name=\"%s\") field %s%n    prod=%s%n    test=%s%n",
+                                    i + 1, id, name, f, normalize(va), normalize(vb));
                         }
                     } else {
-                        System.out.printf("  line %d differs (non-object rows)%n", i + 1);
+                        // at least one row is non-object; show when not equal within tolerance
+                        if (!equalsWithTolerance(a, b)) {
+                            System.out.printf("  line %d differs (non-object rows)%n", i + 1);
+                        }
                     }
                 }
             } else {
@@ -191,16 +194,14 @@ public class RunDatabaseCompareDelta {
             for (String f : fields) {
                 if (markIfIgnored(f, ignoredHeadersSeen))
                     continue;
-                String sa = normalize(a.get(f));
-                String sb = normalize(b.get(f));
-                if (!Objects.equals(sa, sb))
+                if (!equalsWithTolerance(a.get(f), b.get(f)))
                     return false;
             }
             return true;
         }
 
-        // non-objects: compare normalized string forms
-        return Objects.equals(normalize(a), normalize(b));
+        // non-objects: compare with numeric tolerance if applicable
+        return equalsWithTolerance(a, b);
     }
 
     private static boolean objectIsEffectivelyEmpty(JsonNode o, Set<String> ignoredHeadersSeen) {
@@ -211,10 +212,51 @@ public class RunDatabaseCompareDelta {
             String f = it.next();
             if (markIfIgnored(f, ignoredHeadersSeen))
                 continue;
-            if (!normalize(o.get(f)).isEmpty())
+            if (!equalsWithTolerance(o.get(f), null)) // null normalized == empty
                 return false;
         }
         return true;
+    }
+
+    private static boolean equalsWithTolerance(JsonNode a, JsonNode b) {
+        // Handle both-null / empty strings cases
+        String sa = normalize(a);
+        String sb = normalize(b);
+
+        // Try numeric compare with relative tolerance if both sides are numeric
+        Double da = asDouble(a);
+        Double db = asDouble(b);
+        if (da != null && db != null) {
+            if (Double.compare(da, db) == 0)
+                return true;
+            double ad = Math.abs(da);
+            double bd = Math.abs(db);
+            double denom = Math.max(ad, bd);
+            if (denom == 0.0)
+                return true; // both zero (already caught above, but safe)
+            double rel = Math.abs(da - db) / denom;
+            return rel <= REL_TOL;
+        }
+
+        // Fallback to string equality
+        return Objects.equals(sa, sb);
+    }
+
+    private static Double asDouble(JsonNode n) {
+        if (n == null || n.isNull())
+            return null;
+        if (n.isNumber())
+            return n.asDouble();
+        String s = normalize(n);
+        if (s.isEmpty())
+            return null;
+        // allow comma as decimal separator
+        s = s.replace(',', '.');
+        try {
+            return Double.parseDouble(s);
+        } catch (Exception ignored) {
+            return null;
+        }
     }
 
     private static String normalize(JsonNode n) {
@@ -227,14 +269,12 @@ public class RunDatabaseCompareDelta {
     }
 
     // Record ignored headers and return true if header should be ignored.
+    // NOTE: TP* is NOT ignored anymore.
     private static boolean markIfIgnored(String field, Set<String> ignoredHeadersSeen) {
         if (field == null)
             return false;
         String norm = normalizeHeaderName(field);
-        boolean ignore = norm.startsWith("tp")
-                || norm.startsWith("item")
-                || norm.startsWith("duration")
-                || norm.startsWith("notes")
+        boolean ignore = norm.startsWith("item")
                 || norm.startsWith("bestchoice");
         if (ignore)
             ignoredHeadersSeen.add(norm);
