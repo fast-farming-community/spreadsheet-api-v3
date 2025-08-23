@@ -9,10 +9,6 @@ import eu.fast.gw2.tools.Jpa;
 
 public class Gw2PricesDao {
 
-    /**
-     * Load tiered prices for the given item ids from gw2_prices_tiers.
-     * Returns id -> [buy, sell]. Missing rows map to [0,0].
-     */
     @SuppressWarnings("unchecked")
     public static Map<Integer, int[]> loadTier(List<Integer> ids, String tierKey) {
         if (ids == null || ids.isEmpty())
@@ -51,13 +47,11 @@ public class Gw2PricesDao {
             out.put(((Number) r[0]).intValue(),
                     new int[] { ((Number) r[1]).intValue(), ((Number) r[2]).intValue() });
         }
-        // fill absent ids with [0,0]
         for (Integer id : ids)
             out.putIfAbsent(id, new int[] { 0, 0 });
         return out;
     }
 
-    // Read one (used by OverlayEngine fallback)
     public static Integer vendorValueById(int itemId) {
         return Jpa.tx(em -> {
             var r = em.createNativeQuery("""
@@ -70,7 +64,41 @@ public class Gw2PricesDao {
         });
     }
 
-    // Batch upsert vendor values we just fetched
+    /**
+     * Idempotent upsert: only updates when vendor_value actually changes. Returns
+     * updated row count (approx = input size, minus no-op conflicts).
+     */
+    public static int upsertVendorValuesIfChanged(Map<Integer, Integer> vendorMap) {
+        if (vendorMap == null || vendorMap.isEmpty())
+            return 0;
+
+        StringBuilder sb = new StringBuilder(256 + vendorMap.size() * 32);
+        sb.append("""
+                    INSERT INTO public.gw2_prices(item_id, buy, sell, vendor_value, updated_at, ts)
+                    VALUES
+                """);
+
+        boolean first = true;
+        for (var e : vendorMap.entrySet()) {
+            if (!first)
+                sb.append(',');
+            first = false;
+            sb.append("(").append(e.getKey()).append(",0,0,").append(e.getValue()).append(",now(),now())");
+        }
+
+        // Only fire update when the value is different (IS DISTINCT FROM handles NULLs)
+        sb.append("""
+                    ON CONFLICT (item_id) DO UPDATE
+                      SET vendor_value = EXCLUDED.vendor_value,
+                          updated_at   = now()
+                      WHERE gw2_prices.vendor_value IS DISTINCT FROM EXCLUDED.vendor_value
+                """);
+
+        final String sql = sb.toString();
+        return Jpa.tx(em -> em.createNativeQuery(sql).executeUpdate());
+    }
+
+    // Kept for compatibility; still works but updates even on same value.
     public static void upsertVendorValues(Map<Integer, Integer> vendorMap) {
         if (vendorMap == null || vendorMap.isEmpty())
             return;
@@ -85,7 +113,6 @@ public class Gw2PricesDao {
                 if (!first)
                     sb.append(',');
                 first = false;
-                // buy/sell placeholders keep existing values via ON CONFLICT
                 sb.append("(").append(e.getKey()).append(",0,0,").append(e.getValue()).append(",now(),now())");
             }
             sb.append("""
@@ -96,5 +123,4 @@ public class Gw2PricesDao {
             em.createNativeQuery(sb.toString()).executeUpdate();
         });
     }
-
 }

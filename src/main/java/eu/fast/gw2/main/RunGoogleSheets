@@ -1,0 +1,33 @@
+package eu.fast.gw2.main;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Locale;
+
+import eu.fast.gw2.dao.OverlayDao;
+import eu.fast.gw2.enums.Tier;
+import eu.fast.gw2.tools.Jpa;
+import eu.fast.gw2.tools.OverlayEngine;
+
+public class RunGoogleSheets {
+
+    private static final String SHEET_ID = "1WdwWxyP9zeJhcxoQAr-paMX47IuK6l5rqAPYDOA8mho";
+    private static final int SLEEP_MS = 150;
+
+    public static void main(String[] args) throws Exception {
+
+        // 1) Fetch Sheets (named ranges) → upsert into public.tables /
+        // public.detail_tables
+        try {
+            GoogleSheetsImporter importer = new GoogleSheetsImporter(SHEET_ID);
+            importer.runFullImport();
+        } catch (Exception e) {
+            System.err.println("! GoogleSheets import failed: " + e.getMessage());
+            // continue with seeding/recompute; next cron will retry import
+        }
+
+        // 2) Seed + prune calculations
+        RunSeedCalculationsFromDetailTable.main(new String[] { "--force", "--op=SUM", "--taxes=0" });
+        RunSeedCalculationsFromDetailTable.main(new String[] { "--prune" });
+    }
+}
