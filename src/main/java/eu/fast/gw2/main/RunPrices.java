@@ -24,6 +24,7 @@ public class RunPrices {
 
         // Recompute overlays (detail_tables + main tables) for all tiers
         OverlayEngine.recomputeAndPersistAllOverlays(TIERS, OVERLAY_SLEEP_MS);
+        //OverlayEngine.recomputeAndPersistAllOverlays(new Tier[]{ Tier.T5M }, 100);
 
         System.out.println("RunPrices done.");
     }

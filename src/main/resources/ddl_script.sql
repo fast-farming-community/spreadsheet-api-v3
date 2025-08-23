@@ -9,25 +9,25 @@ CREATE TABLE IF NOT EXISTS public.gw2_prices (
   CONSTRAINT gw2_prices_pkey PRIMARY KEY (item_id)
 );
 
--- detail_tables overlays
+--  detail_tables_overlay
 CREATE TABLE IF NOT EXISTS public.detail_tables_overlay (
+  id BIGSERIAL PRIMARY KEY,
   detail_feature_id BIGINT NOT NULL,
-  key VARCHAR(255) NOT NULL,
-  tier VARCHAR(16) NOT NULL,
-  -- '5m','10m','15m','60m'
+  key TEXT NOT NULL,
+  tier TEXT NOT NULL,
   rows JSONB NOT NULL,
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  PRIMARY KEY (detail_feature_id, key, tier)
+  UNIQUE (detail_feature_id, key, tier)
 );
 
--- tables overlays
+--  tables_overlay
 CREATE TABLE IF NOT EXISTS public.tables_overlay (
-  key VARCHAR(255) NOT NULL,
-  tier VARCHAR(16) NOT NULL,
-  -- '5m','10m','15m','60m'
+  id BIGSERIAL PRIMARY KEY,
+  key TEXT NOT NULL,
+  tier TEXT NOT NULL,
   rows JSONB NOT NULL,
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  PRIMARY KEY (key, tier)
+  UNIQUE (key, tier)
 );
 
 -- gw2_prices_tiers
@@ -62,3 +62,11 @@ CREATE INDEX IF NOT EXISTS gw2_prices_tiers_ts_10m_idx ON public.gw2_prices_tier
 CREATE INDEX IF NOT EXISTS gw2_prices_tiers_ts_15m_idx ON public.gw2_prices_tiers(ts_15m);
 
 CREATE INDEX IF NOT EXISTS gw2_prices_tiers_ts_60m_idx ON public.gw2_prices_tiers(ts_60m);
+
+CREATE INDEX IF NOT EXISTS idx_tables_overlay_tier ON public.tables_overlay (tier);
+
+CREATE INDEX IF NOT EXISTS idx_tables_overlay_key ON public.tables_overlay (key);
+
+CREATE INDEX IF NOT EXISTS idx_detail_tables_overlay_tier ON public.detail_tables_overlay (tier);
+
+CREATE INDEX IF NOT EXISTS idx_detail_tables_overlay_key ON public.detail_tables_overlay (key);
