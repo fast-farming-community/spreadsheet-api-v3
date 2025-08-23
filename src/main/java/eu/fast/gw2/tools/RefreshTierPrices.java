@@ -1,4 +1,4 @@
-package eu.fast.gw2.main;
+package eu.fast.gw2.tools;
 
 import java.util.HashMap;
 import java.util.List;
@@ -10,18 +10,30 @@ import java.util.stream.Collectors;
 
 import eu.fast.gw2.dao.Gw2PricesDao;
 import eu.fast.gw2.dao.TierPricesDao;
-import eu.fast.gw2.tools.Gw2ApiClient;
-import eu.fast.gw2.tools.Jpa;
 
-public class RunRefreshTierPrices {
+public class RefreshTierPrices {
 
-    public static void main(String[] args) throws Exception {
+    private static final int BATCH = 200;
+
+    /** Execution summary for logging/metrics. */
+    public record Summary(int picked, int updated5m, int updated10m, int updated15m, int updated60m,
+            int vendorUpdated) {
+    }
+
+    /** Parses args (e.g. --limit= / -l=) and delegates. */
+    public static Summary refreshFromArgs(String[] args, int sleepMs) throws Exception {
         String limStr = arg(args, new String[] { "--limit=", "-l=" }, null);
-        Integer overallCap = parseLimit(limStr);
+        return refresh(limStr, sleepMs);
+    }
 
-        int sleepMs = Integer.parseInt(Optional.ofNullable(System.getenv("GW2API_SLEEP_MS")).orElse("150"));
-        final int BATCH = 200;
+    /** Accepts raw limit string, parses internally. */
+    public static Summary refresh(String limitArgOrNull, int sleepMs) throws Exception {
+        Integer overallCap = parseLimit(limitArgOrNull);
+        return refresh(overallCap, sleepMs);
+    }
 
+    /** Refactored runner (no main). */
+    public static Summary refresh(Integer overallCap, int sleepMs) throws Exception {
         System.out.println(">>> RefreshTierPrices (multi-tier) overallCap=" +
                 (overallCap == null ? "all" : overallCap) +
                 " batch=" + BATCH + " sleepMs=" + sleepMs);
@@ -29,14 +41,13 @@ public class RunRefreshTierPrices {
         List<DueRow> candidates = pickDueCandidates(overallCap);
         if (candidates.isEmpty()) {
             System.out.println("No stale items for any tier. Nothing to do.");
-            return;
+            return new Summary(0, 0, 0, 0, 0, 0);
         }
         System.out.println("Picked " + candidates.size() + " items to refresh.");
 
         int total = candidates.size();
         int batches = (total + BATCH - 1) / BATCH;
 
-        // totals
         int total5m = 0, total10m = 0, total15m = 0, total60m = 0, totalVendorUpdated = 0;
 
         for (int bi = 0; bi < batches; bi++) {
@@ -52,7 +63,7 @@ public class RunRefreshTierPrices {
                     .collect(Collectors.toSet());
 
             Map<Integer, Boolean> isBound;
-            Map<Integer, Integer> vendor; // from API (subset will be used)
+            Map<Integer, Integer> vendor;
             Iterable<Gw2ApiClient.PriceEntry> priceEntries;
             try {
                 var items = withRetry(() -> Gw2ApiClient.fetchItemsBatch(ids), 3, sleepMs, "items");
@@ -77,11 +88,8 @@ public class RunRefreshTierPrices {
                 int sellUnit = (p.sells() == null ? 0 : Math.max(0, p.sells().unitPrice()));
 
                 activity.put(id, buyQty + sellQty);
-                if (Boolean.TRUE.equals(isBound.get(id))) {
-                    normalized.put(id, new int[] { 0, 0 });
-                } else {
-                    normalized.put(id, new int[] { buyUnit, sellUnit });
-                }
+                normalized.put(id,
+                        Boolean.TRUE.equals(isBound.get(id)) ? new int[] { 0, 0 } : new int[] { buyUnit, sellUnit });
             }
             for (Integer id : ids) { // ensure presence
                 normalized.putIfAbsent(id, new int[] { 0, 0 });
@@ -89,13 +97,9 @@ public class RunRefreshTierPrices {
             }
 
             try {
-                // Write all tiers in one call (5m always, coarse only if due)
                 TierPricesDao.upsertMulti(normalized, due10, due15, due60, activity);
 
-                // Logging (concise)
-                int updated5m = normalized.size();
-                total5m += updated5m;
-
+                total5m += normalized.size();
                 if (!due10.isEmpty()) {
                     total10m += due10.size();
                     System.out.println("buy_10m & sell_10m updated for ids: " + formatIds(due10, 50));
@@ -109,14 +113,12 @@ public class RunRefreshTierPrices {
                     System.out.println("buy_60m & sell_60m updated for ids: " + formatIds(due60, 50));
                 }
 
-                // Vendor: only insert for rows that are missing in DB (no per-batch diff-check)
-                if (!vendorMissing.isEmpty() && !vendor.isEmpty()) {
+                if (!vendorMissing.isEmpty()) {
                     Map<Integer, Integer> vendorToInsert = vendor.entrySet().stream()
                             .filter(e -> vendorMissing.contains(e.getKey()))
                             .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
-
                     if (!vendorToInsert.isEmpty()) {
-                        Gw2PricesDao.upsertVendorValues(vendorToInsert);
+                        Gw2PricesDao.upsertVendorValuesIfChanged(vendorToInsert);
                         totalVendorUpdated += vendorToInsert.size();
                         System.out.println("vendor_value updated for ids: " + formatIds(vendorToInsert.keySet(), 50));
                     }
@@ -142,6 +144,8 @@ public class RunRefreshTierPrices {
         System.out.println("  15m updated count = " + total15m);
         System.out.println("  60m updated count = " + total60m);
         System.out.println("  vendor_value updated count = " + totalVendorUpdated);
+
+        return new Summary(total, total5m, total10m, total15m, total60m, totalVendorUpdated);
     }
 
     /** one-shot candidate picker with due flags for 10/15/60 + vendorMissing */
@@ -214,7 +218,6 @@ public class RunRefreshTierPrices {
     }
 
     // ---- logging helpers
-
     private static String formatIds(Iterable<Integer> ids, int max) {
         var list = new java.util.ArrayList<Integer>();
         for (Integer i : ids)
@@ -226,30 +229,7 @@ public class RunRefreshTierPrices {
         return head.toString().replace("]", "") + ", ...(+" + (list.size() - max) + " more)]";
     }
 
-    // ---- utils
-
-    private static String arg(String[] args, String[] keys, String def) {
-        for (String a : args)
-            for (String k : keys)
-                if (a.startsWith(k))
-                    return a.substring(k.length());
-        return def;
-    }
-
-    private static Integer parseLimit(String s) {
-        if (s == null)
-            return null;
-        String v = s.trim().toLowerCase(Locale.ROOT);
-        if (v.isEmpty() || v.equals("all") || v.equals("0"))
-            return null;
-        try {
-            int n = Integer.parseInt(v);
-            return (n <= 0) ? null : n;
-        } catch (Exception e) {
-            return null;
-        }
-    }
-
+    // ---- retry helper
     @FunctionalInterface
     private interface ThrowingSupplier<T> {
         T get() throws Exception;
@@ -266,7 +246,6 @@ public class RunRefreshTierPrices {
                 boolean lastAttempt = (i == attempts - 1);
                 if (lastAttempt)
                     throw e;
-
                 int backoff = Math.max(0, baseSleepMs) * Math.max(1, 1 << i);
                 System.err.printf("  %s fetch failed (attempt %d/%d): %s%n", label, i + 1, attempts, e.getMessage());
                 try {
@@ -282,5 +261,29 @@ public class RunRefreshTierPrices {
 
     // --- helper holder
     private record DueRow(int id, boolean due10, boolean due15, boolean due60, boolean vendorMissing) {
+    }
+
+    private static Integer parseLimit(String s) {
+        if (s == null)
+            return null;
+        String v = s.trim().toLowerCase(java.util.Locale.ROOT);
+        if (v.isEmpty() || v.equals("all") || v.equals("0"))
+            return null;
+        try {
+            int n = Integer.parseInt(v);
+            return (n <= 0) ? null : n;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private static String arg(String[] args, String[] keys, String def) {
+        if (args != null) {
+            for (String a : args)
+                for (String k : keys)
+                    if (a.startsWith(k))
+                        return a.substring(k.length());
+        }
+        return def;
     }
 }
