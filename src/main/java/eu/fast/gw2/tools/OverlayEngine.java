@@ -1,15 +1,9 @@
 package eu.fast.gw2.tools;
 
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
-
-import eu.fast.gw2.dao.CalculationsDao;
-import eu.fast.gw2.dao.Gw2PricesDao;
+import java.util.*;
 import eu.fast.gw2.dao.OverlayDao;
+import eu.fast.gw2.dao.Gw2PricesDao;
+import eu.fast.gw2.dao.CalculationsDao;
 import eu.fast.gw2.enums.Tier;
 
 public class OverlayEngine {

@@ -1,0 +1,18 @@
+name: Deploy to fast_test
+
+on:
+  push:
+    branches: [ main ]   # change if your default branch is different
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run deploy script on server
+        uses: appleboy/ssh-action@v1.1.0
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_KEY }}
+          script: |
+            /bin/bash -lc 'cd ~/spreadsheet-api-v3 && ./deploy-update.sh'
