@@ -52,7 +52,6 @@ public final class HibernateUtil {
                 eu.fast.gw2.model.Guide.class,
                 eu.fast.gw2.model.MetadataRow.class,
                 eu.fast.gw2.model.Role.class,
-                eu.fast.gw2.model.SchemaMigration.class,
                 eu.fast.gw2.model.TableEntry.class,
                 eu.fast.gw2.model.User.class));
 
