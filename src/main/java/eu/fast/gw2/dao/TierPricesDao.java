@@ -76,14 +76,13 @@ public class TierPricesDao {
     /**
      * One-shot multi-tier upsert.
      * - Always writes 5m (buy/sell + ts_5m=now()).
-     * - Writes 10m/15m/60m only when the ID is in the respective due set (else
+     * - Writes 15m/60m only when the ID is in the respective due set (else
      * leaves columns as-is).
      * - Writes activity_last/activity_ts for all rows.
      * 
      * @return number of rows inserted/updated (size of input map).
      */
     public static int upsertMulti(Map<Integer, int[]> prices,
-            Set<Integer> due10,
             Set<Integer> due15,
             Set<Integer> due60,
             Map<Integer, Integer> activity) {
@@ -97,7 +96,6 @@ public class TierPricesDao {
                     INSERT INTO public.gw2_prices_tiers (
                         item_id,
                         buy_5m,  sell_5m,  ts_5m,
-                        buy_10m, sell_10m, ts_10m,
                         buy_15m, sell_15m, ts_15m,
                         buy_60m, sell_60m, ts_60m,
                         activity_last, activity_ts, updated_at
@@ -111,7 +109,6 @@ public class TierPricesDao {
             int sell = (e.getValue() != null && e.getValue().length > 1) ? e.getValue()[1] : 0;
             int act = (activity != null && activity.containsKey(id)) ? activity.get(id) : 0;
 
-            boolean d10 = due10 != null && due10.contains(id);
             boolean d15 = due15 != null && due15.contains(id);
             boolean d60 = due60 != null && due60.contains(id);
 
@@ -122,10 +119,6 @@ public class TierPricesDao {
             sb.append('(').append(id).append(',')
                     // 5m always
                     .append(buy).append(',').append(sell).append(", now(),")
-                    // 10m conditional
-                    .append(d10 ? String.valueOf(buy) : "NULL").append(',')
-                    .append(d10 ? String.valueOf(sell) : "NULL").append(',')
-                    .append(d10 ? "now()" : "NULL").append(',')
                     // 15m conditional
                     .append(d15 ? String.valueOf(buy) : "NULL").append(',')
                     .append(d15 ? String.valueOf(sell) : "NULL").append(',')
@@ -145,11 +138,7 @@ public class TierPricesDao {
                       sell_5m = EXCLUDED.sell_5m,
                       ts_5m   = EXCLUDED.ts_5m,
 
-                      -- 10m/15m/60m only when provided (EXCLUDED is non-null)
-                      buy_10m  = COALESCE(EXCLUDED.buy_10m,  gw2_prices_tiers.buy_10m),
-                      sell_10m = COALESCE(EXCLUDED.sell_10m, gw2_prices_tiers.sell_10m),
-                      ts_10m   = COALESCE(EXCLUDED.ts_10m,   gw2_prices_tiers.ts_10m),
-
+                      -- 15m/60m only when provided (EXCLUDED is non-null)
                       buy_15m  = COALESCE(EXCLUDED.buy_15m,  gw2_prices_tiers.buy_15m),
                       sell_15m = COALESCE(EXCLUDED.sell_15m, gw2_prices_tiers.sell_15m),
                       ts_15m   = COALESCE(EXCLUDED.ts_15m,   gw2_prices_tiers.ts_15m),

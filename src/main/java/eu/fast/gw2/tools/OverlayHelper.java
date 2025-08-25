@@ -6,6 +6,8 @@ public class OverlayHelper {
 
     // Column names (detail_tables)
     public static final String COL_ID = "Id";
+    public static final String COL_IMAGE = "Image";
+    public static final String COL_RARITY = "Rarity";
     public static final String COL_CAT = "Category";
     public static final String COL_KEY = "Key";
     public static final String COL_NAME = "Name";

@@ -17,8 +17,10 @@ public class Gw2ApiClient {
     private static final long BASE_BACKOFF_MS = 400L;
 
     private static final HttpClient HTTP = HttpClient.newBuilder()
+            .version(HttpClient.Version.HTTP_2) // enable HTTP/2 if server supports it
             .connectTimeout(Duration.ofSeconds(10))
             .build();
+
     private static final ObjectMapper M = new ObjectMapper();
 
     /** Matches `/v2/commerce/prices` JSON shape and your runner's expectations. */
@@ -32,7 +34,11 @@ public class Gw2ApiClient {
     }
 
     @JsonIgnoreProperties(ignoreUnknown = true)
-    public record Item(int id, java.util.List<String> flags, Integer vendor_value) {
+    public record Item(int id,
+            String icon,
+            String rarity,
+            java.util.List<String> flags,
+            Integer vendor_value) {
     }
 
     /** Public: fetch raw TP prices for given IDs, chunked and merged. */
@@ -89,6 +95,26 @@ public class Gw2ApiClient {
         });
     }
 
+    public static Map<Integer, String> itemImageUrlMap(List<Item> items) {
+        Map<Integer, String> out = new HashMap<>();
+        for (Item it : items) {
+            if (it.icon() != null && !it.icon().isBlank()) { // API field is "icon"
+                out.put(it.id(), it.icon()); // we store as "image" in DB
+            }
+        }
+        return out;
+    }
+
+    public static Map<Integer, String> itemRarityMap(List<Item> items) {
+        Map<Integer, String> out = new HashMap<>();
+        for (Item it : items) {
+            if (it.rarity() != null && !it.rarity().isBlank()) {
+                out.put(it.id(), it.rarity());
+            }
+        }
+        return out;
+    }
+
     public static Map<Integer, Boolean> accountBoundMap(List<Item> items) {
         Map<Integer, Boolean> out = new HashMap<>();
         for (Item it : items) {
@@ -101,8 +127,9 @@ public class Gw2ApiClient {
     public static Map<Integer, Integer> vendorValueMap(List<Item> items) {
         Map<Integer, Integer> out = new HashMap<>();
         for (Item it : items) {
-            if (it.vendor_value() != null)
+            if (it.vendor_value() != null) {
                 out.put(it.id(), it.vendor_value());
+            }
         }
         return out;
     }

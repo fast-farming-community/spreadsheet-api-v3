@@ -14,17 +14,16 @@ public class RunPrices {
     private static final int GW2API_SLEEP_MS = Integer
             .parseInt(Optional.ofNullable(System.getenv("GW2API_SLEEP_MS")).orElse("150"));
 
-    private static final Tier[] TIERS = { Tier.T5M, Tier.T10M, Tier.T15M, Tier.T60M };
+    private static final Tier[] TIERS = { Tier.T5M, Tier.T15M, Tier.T60M };
 
     public static void main(String[] args) throws Exception {
         System.out.println(">>> RunPrices starting…");
 
         // Refresh GW2 tier prices
-        RefreshTierPrices.refreshFromArgs(args, GW2API_SLEEP_MS);
+        RefreshTierPrices.refresh(null, GW2API_SLEEP_MS);
 
         // Recompute overlays (detail_tables + main tables) for all tiers
         OverlayEngine.recomputeAndPersistAllOverlays(TIERS, OVERLAY_SLEEP_MS);
-        //OverlayEngine.recomputeAndPersistAllOverlays(new Tier[]{ Tier.T5M }, 100);
 
         System.out.println("RunPrices done.");
     }

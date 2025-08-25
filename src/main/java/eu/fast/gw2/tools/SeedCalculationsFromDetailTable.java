@@ -13,12 +13,12 @@ import com.fasterxml.jackson.databind.ObjectMapper;
  * Strict-DSL seeder + table-level ops:
  * - Scans BOTH public.detail_tables.rows and public.tables.rows.
  * - Discovers distinct (Category, Key) pairs including LEAF (Key="").
- * - INSERTS ONLY missing pairs with formulas_json={"mode": "..."} and
- * taxes=NULL.
- * - Seeds table-level operation per table: INTERNAL => MAX, else SUM (insert or
- * update only if operation IS NULL).
- * - Does NOT overwrite existing formulas or ops unless empty.
- * - PRUNES ONLY rows previously auto-seeded by this tool (notes LIKE specific
+ * - UPSERTS default formulas_json={"mode": "..."} ONLY when formulas_json IS
+ * NULL.
+ * (Never overwrites an existing formulas_json.)
+ * - Seeds table-level operation per table: INTERNAL => MAX, else SUM (set ONLY
+ * when operation IS NULL).
+ * - PRUNES ONLY rows previously auto-seeded by this tool (notes LIKE our
  * prefixes).
  */
 public class SeedCalculationsFromDetailTable {
@@ -31,9 +31,12 @@ public class SeedCalculationsFromDetailTable {
 
     private static final ObjectMapper M = new ObjectMapper();
 
+    // satisfy NOT NULL on taxes (engine can still apply defaults)
+    private static final int DEFAULT_TAXES = 0;
+
     public static void run() throws Exception {
         System.out.println(
-                ">>> SeedCalculations: strict DSL (insert missing) + table ops (MAX for INTERNAL, else SUM) + prune own");
+                ">>> SeedCalculations: default formulas_json (no overwrite) + table ops (INTERNAL->MAX, else SUM) + prune own");
 
         // 1) read JSON rows from BOTH sources
         List<Object[]> detailTables = Jpa.tx(em -> {
@@ -58,7 +61,7 @@ public class SeedCalculationsFromDetailTable {
 
         // 2) discover row-level (category,key) pairs INCLUDING LEAF (key="")
         Set<Pair> discoveredDslPairs = new LinkedHashSet<>();
-        // 2b) discover table-level (category,key=tableName) for ops
+        // 2b) discover table-level pairs (dominant category + tableName) for ops
         Set<Pair> discoveredTablePairs = new LinkedHashSet<>();
 
         int jsonErrors = 0;
@@ -74,7 +77,7 @@ public class SeedCalculationsFromDetailTable {
                 }
                 // COMPOSITE/INTERNAL = key present -> (category, key)
                 else if (key != null && !key.isBlank()) {
-                    String c = (cat == null ? "" : cat.trim()); // INTERNAL or other categories allowed
+                    String c = (cat == null ? "" : cat.trim()); // categories are lower-case in your sheets
                     discoveredDslPairs.add(new Pair(c, key.trim()));
                 }
             }
@@ -91,9 +94,7 @@ public class SeedCalculationsFromDetailTable {
             try {
                 List<Map<String, Object>> rows = M.readValue(json, new TypeReference<List<Map<String, Object>>>() {
                 });
-                // row-level discovery
                 collectRowPairs.accept(rows);
-                // table-level op pair (dominant category + table key)
                 String domCat = OverlayHelper.dominantCategory(rows);
                 if (domCat != null && !domCat.isBlank() && tableKey != null && !tableKey.isBlank()) {
                     discoveredTablePairs.add(new Pair(domCat.trim(), tableKey.trim()));
@@ -118,9 +119,7 @@ public class SeedCalculationsFromDetailTable {
             try {
                 List<Map<String, Object>> rows = M.readValue(json, new TypeReference<List<Map<String, Object>>>() {
                 });
-                // row-level discovery
                 collectRowPairs.accept(rows);
-                // table-level op pair (dominant category + table name)
                 String domCat = OverlayHelper.dominantCategory(rows);
                 if (domCat != null && !domCat.isBlank() && name != null && !name.isBlank()) {
                     discoveredTablePairs.add(new Pair(domCat.trim(), name.trim()));
@@ -137,79 +136,68 @@ public class SeedCalculationsFromDetailTable {
         System.out.println("Discovered DSL pairs: " + discoveredDslPairs.size());
         System.out.println("Discovered table op pairs: " + discoveredTablePairs.size());
 
-        // 3) load existing pairs (category,key)
-        List<Pair> existingPairs = Jpa.tx(em -> {
-            @SuppressWarnings("unchecked")
-            List<Object[]> rows = em.createNativeQuery("""
-                        SELECT category, key FROM public.calculations
-                    """).getResultList();
-            return rows.stream().map(r -> new Pair((String) r[0], (String) r[1])).toList();
-        });
-        var existingSet = new java.util.HashSet<>(existingPairs);
-
-        // 4) insert ONLY missing DSL pairs with {"mode": "..."} and taxes=NULL
-        int insertedDsl = 0;
+        // 3) UPSERT default formulas_json per discovered (category,key)
+        int filledOrInserted = 0;
         for (var p : discoveredDslPairs) {
-            if (existingSet.contains(p))
-                continue;
+            final String mode = (p.category().isEmpty() && p.key().isEmpty()) ? "LEAF"
+                    : (equalsIgnoreCase(p.category(), "INTERNAL")) ? "INTERNAL"
+                            : "COMPOSITE";
 
-            String mode;
-            if (p.category().isEmpty() && p.key().isEmpty()) { // global LEAF rule
-                mode = "LEAF";
-            } else if (equalsIgnoreCase(p.category(), "INTERNAL")) { // INTERNAL with key present
-                mode = "INTERNAL";
-            } else { // any non-INTERNAL with key present
-                mode = "COMPOSITE";
-            }
+            final String formulasJson = "{\"mode\":\"" + mode + "\"}";
 
-            String formulasJson = "{\"mode\":\"" + mode + "\"}";
+            // Safe default row-level operation (satisfy NOT NULL)
+            final String defaultRowOp = "SUM";
 
-            insertedDsl += Jpa.tx(em -> em.createNativeQuery("""
+            filledOrInserted += Jpa.tx(em -> em.createNativeQuery("""
                         INSERT INTO public.calculations
-                            (category, key, operation, taxes, source_table_key, formulas_json, notes)
-                        VALUES (:c, :k, :op, :tx, :src, :fjson, :notes)
-                        ON CONFLICT (category, key) DO NOTHING
+                              (category, key, operation, taxes, source_table_key, formulas_json, notes)
+                        VALUES (:c, :k, :op, :tx, NULL, :fjson, :notes)
+                        ON CONFLICT (category, key) DO UPDATE
+                            SET formulas_json = EXCLUDED.formulas_json,
+                                notes = CASE
+                                          WHEN public.calculations.formulas_json IS NULL THEN EXCLUDED.notes
+                                          ELSE public.calculations.notes
+                                        END
+                          WHERE public.calculations.formulas_json IS NULL
                     """)
                     .setParameter("c", p.category())
                     .setParameter("k", p.key())
-                    .setParameter("op", null) // no row-level op by default
-                    .setParameter("tx", null) // taxes NULL; engine picks defaults
-                    .setParameter("src", null)
+                    .setParameter("op", defaultRowOp)
+                    .setParameter("tx", DEFAULT_TAXES) // <-- was NULL
                     .setParameter("fjson", formulasJson)
                     .setParameter("notes", NOTES_PREFIX_DSL + " (mode=" + mode + ")")
                     .executeUpdate());
         }
-        System.out.println("Inserted " + insertedDsl + " new strict-DSL rows.");
+        System.out.println("Formulas filled/inserted: " + filledOrInserted);
 
-        // 5) seed/ensure table-level operation (INTERNAL => MAX, else SUM), but only if
-        // operation is NULL
+        // 4) seed/ensure table-level operation: INTERNAL => MAX, else SUM (ONLY when op
+        // IS NULL)
         int upsertsOps = 0;
         for (var p : discoveredTablePairs) {
             String op = equalsIgnoreCase(p.category(), "INTERNAL") ? "MAX" : "SUM";
-
-            // Insert if missing; if present, update operation ONLY when it's NULL.
             upsertsOps += Jpa.tx(em -> em
                     .createNativeQuery(
                             """
                                         INSERT INTO public.calculations (category, key, operation, taxes, source_table_key, formulas_json, notes)
-                                        VALUES (:c, :k, :op, NULL, NULL, NULL, :notes)
+                                        VALUES (:c, :k, :op, :tx, NULL, NULL, :notes)
                                         ON CONFLICT (category, key) DO UPDATE
                                             SET operation = EXCLUDED.operation,
                                                 notes = CASE
-                                                            WHEN public.calculations.operation IS NULL THEN EXCLUDED.notes
-                                                            ELSE public.calculations.notes
+                                                          WHEN public.calculations.operation IS NULL THEN EXCLUDED.notes
+                                                          ELSE public.calculations.notes
                                                         END
                                           WHERE public.calculations.operation IS NULL
                                     """)
                     .setParameter("c", p.category())
                     .setParameter("k", p.key())
                     .setParameter("op", op)
+                    .setParameter("tx", DEFAULT_TAXES) // <-- was NULL
                     .setParameter("notes", NOTES_PREFIX_OPS + " (op=" + op + ")")
                     .executeUpdate());
         }
-        System.out.println("Upserted " + upsertsOps + " table-op rows (set only where operation was NULL).");
+        System.out.println("Table-op set (only where NULL): " + upsertsOps);
 
-        // 6) prune ONLY our auto-seeded rows that are no longer discovered
+        // 5) prune ONLY our auto-seeded rows that are no longer discovered
         pruneStaleByPrefix(discoveredDslPairs, NOTES_PREFIX_DSL);
         pruneStaleByPrefix(discoveredTablePairs, NOTES_PREFIX_OPS);
 
@@ -241,8 +229,8 @@ public class SeedCalculationsFromDetailTable {
             int sum = 0;
             for (var p : stale) {
                 sum += em.createNativeQuery("""
-                                DELETE FROM public.calculations
-                                 WHERE category = :c AND key = :k AND notes LIKE :prefix
+                            DELETE FROM public.calculations
+                             WHERE category = :c AND key = :k AND notes LIKE :prefix
                         """)
                         .setParameter("c", p.category())
                         .setParameter("k", p.key())

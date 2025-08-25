@@ -99,6 +99,24 @@ public class GoogleSheetsImporter {
             return;
         }
 
+        // Self-heal: drop DB rows that point to missing *named ranges* in Sheets
+        // (We only treat entries without '!' as named ranges; A1 ranges are left
+        // alone.)
+        Set<String> existingNamedRanges = listNamedRanges();
+        List<String> missingNamed = names.stream()
+                .filter(n -> n != null && !n.isBlank())
+                .filter(n -> !n.contains("!")) // looks like a NamedRange, not A1
+                .filter(n -> !existingNamedRanges.contains(n)) // not present in the sheet anymore
+                .toList();
+
+        if (!missingNamed.isEmpty()) {
+            int removed = deleteRangesInDb(missingNamed);
+            System.out.printf(Locale.ROOT,
+                    "Pruned %d DB rows for missing named ranges: %s%n", removed, missingNamed);
+            // filter them out from this run to avoid API 400
+            names = names.stream().filter(n -> !missingNamed.contains(n)).toList();
+        }
+
         System.out.printf(Locale.ROOT, "Starting Sheets import: %d ranges in DB%n", names.size());
 
         // Optionally group by sheet (ranges like "SheetName!A1:B5")
@@ -412,6 +430,40 @@ public class GoogleSheetsImporter {
         long m = (totalSeconds % 3600) / 60;
         long s = (totalSeconds % 60);
         return String.format(Locale.ROOT, "%02d:%02d:%02d", h, m, s);
+    }
+
+    // List all named ranges in the spreadsheet (names only)
+    private Set<String> listNamedRanges() throws Exception {
+        var meta = sheets.spreadsheets().get(spreadsheetId)
+                .setFields("namedRanges(name)")
+                .execute();
+        var nrs = Optional.ofNullable(meta.getNamedRanges()).orElse(Collections.emptyList());
+        Set<String> names = new java.util.HashSet<>(nrs.size());
+        for (var nr : nrs) {
+            if (nr.getName() != null && !nr.getName().isBlank()) {
+                names.add(nr.getName());
+            }
+        }
+        return names;
+    }
+
+    // Remove rows whose "range" matches any of the given values (from both
+    // detail_tables and tables)
+    private int deleteRangesInDb(java.util.Collection<String> ranges) {
+        if (ranges == null || ranges.isEmpty())
+            return 0;
+        return Jpa.tx(em -> {
+            int sum = 0;
+            for (String r : ranges) {
+                sum += em.createNativeQuery("""
+                            DELETE FROM public.detail_tables WHERE "range" = :r
+                        """).setParameter("r", r).executeUpdate();
+                sum += em.createNativeQuery("""
+                            DELETE FROM public.tables       WHERE "range" = :r
+                        """).setParameter("r", r).executeUpdate();
+            }
+            return sum;
+        });
     }
 
 }

@@ -1,12 +1,13 @@
 package eu.fast.gw2.tools;
 
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
-import java.util.stream.Collectors;
 
 import eu.fast.gw2.dao.Gw2PricesDao;
 import eu.fast.gw2.dao.TierPricesDao;
@@ -16,24 +17,13 @@ public class RefreshTierPrices {
     private static final int BATCH = 200;
 
     /** Execution summary for logging/metrics. */
-    public record Summary(int picked, int updated5m, int updated10m, int updated15m, int updated60m,
-            int vendorUpdated) {
-    }
-
-    /** Parses args (e.g. --limit= / -l=) and delegates. */
-    public static Summary refreshFromArgs(String[] args, int sleepMs) throws Exception {
-        String limStr = arg(args, new String[] { "--limit=", "-l=" }, null);
-        return refresh(limStr, sleepMs);
-    }
-
-    /** Accepts raw limit string, parses internally. */
-    public static Summary refresh(String limitArgOrNull, int sleepMs) throws Exception {
-        Integer overallCap = parseLimit(limitArgOrNull);
-        return refresh(overallCap, sleepMs);
+    public record Summary(int picked, int updated5m, int updated15m, int updated60m, int vendorUpdated) {
     }
 
     /** Refactored runner (no main). */
     public static Summary refresh(Integer overallCap, int sleepMs) throws Exception {
+        final long runStart = System.currentTimeMillis();
+
         System.out.println(">>> RefreshTierPrices (multi-tier) overallCap=" +
                 (overallCap == null ? "all" : overallCap) +
                 " batch=" + BATCH + " sleepMs=" + sleepMs);
@@ -41,69 +31,133 @@ public class RefreshTierPrices {
         List<DueRow> candidates = pickDueCandidates(overallCap);
         if (candidates.isEmpty()) {
             System.out.println("No stale items for any tier. Nothing to do.");
-            return new Summary(0, 0, 0, 0, 0, 0);
+            System.out.printf(Locale.ROOT, "RefreshTierPrices done in %.1fs%n",
+                    (System.currentTimeMillis() - runStart) / 1000.0);
+            return new Summary(0, 0, 0, 0, 0);
         }
         System.out.println("Picked " + candidates.size() + " items to refresh.");
 
         int total = candidates.size();
         int batches = (total + BATCH - 1) / BATCH;
 
-        int total5m = 0, total10m = 0, total15m = 0, total60m = 0, totalVendorUpdated = 0;
+        int total5m = 0, total15m = 0, total60m = 0, totalVendorUpdated = 0;
 
         for (int bi = 0; bi < batches; bi++) {
             int off = bi * BATCH;
             int end = Math.min(off + BATCH, total);
-            var rows = candidates.subList(off, end);
-            var ids = rows.stream().map(DueRow::id).collect(Collectors.toList());
+            List<DueRow> rows = candidates.subList(off, end);
 
-            Set<Integer> due10 = rows.stream().filter(DueRow::due10).map(DueRow::id).collect(Collectors.toSet());
-            Set<Integer> due15 = rows.stream().filter(DueRow::due15).map(DueRow::id).collect(Collectors.toSet());
-            Set<Integer> due60 = rows.stream().filter(DueRow::due60).map(DueRow::id).collect(Collectors.toSet());
-            Set<Integer> vendorMissing = rows.stream().filter(DueRow::vendorMissing).map(DueRow::id)
-                    .collect(Collectors.toSet());
+            // Single pass over rows: collect everything with minimal allocations
+            List<Integer> ids = new ArrayList<>(rows.size());
+            Set<Integer> due15 = new HashSet<>();
+            Set<Integer> due60 = new HashSet<>();
+            Set<Integer> vendorMissing = new HashSet<>();
+            Set<Integer> needItemsIds = new HashSet<>();
 
-            Map<Integer, Boolean> isBound;
-            Map<Integer, Integer> vendor;
-            Iterable<Gw2ApiClient.PriceEntry> priceEntries;
+            boolean needImages = false;
+            boolean needRarities = false;
+
+            for (int i = 0; i < rows.size(); i++) {
+                DueRow r = rows.get(i);
+                int id = r.id();
+                ids.add(id);
+                if (r.due15())
+                    due15.add(id);
+                if (r.due60())
+                    due60.add(id);
+                if (r.vendorMissing()) {
+                    vendorMissing.add(id);
+                    needItemsIds.add(id);
+                }
+                if (r.imageMissing()) {
+                    needImages = true;
+                    needItemsIds.add(id);
+                }
+                if (r.rarityMissing()) {
+                    needRarities = true;
+                    needItemsIds.add(id);
+                }
+            }
+
+            Map<Integer, Boolean> isBound; // empty when no /items fetch
+            Map<Integer, Integer> vendor; // empty when no /items fetch
+            List<Gw2ApiClient.PriceEntry> priceEntries;
+            List<Gw2ApiClient.Item> items = List.of(); // stays empty if not needed
+
             try {
-                var items = withRetry(() -> Gw2ApiClient.fetchItemsBatch(ids), 3, sleepMs, "items");
+                // Prices are required every batch
+                priceEntries = withRetry(() -> Gw2ApiClient.fetchPricesBatch(ids), 3, sleepMs, "pricesBatch");
+
+                // /items only if there is any vendor/image/rarity gap
+                if (!needItemsIds.isEmpty()) {
+                    // no sorting needed
+                    List<Integer> needList = new ArrayList<>(needItemsIds.size());
+                    needList.addAll(needItemsIds);
+                    items = withRetry(() -> Gw2ApiClient.fetchItemsBatch(needList), 3, sleepMs, "items");
+                }
+
                 isBound = Gw2ApiClient.accountBoundMap(items);
                 vendor = Gw2ApiClient.vendorValueMap(items);
-                priceEntries = withRetry(() -> Gw2ApiClient.fetchPricesBatch(ids), 3, sleepMs, "pricesBatch");
+
             } catch (Exception e) {
                 System.err.println("Batch " + (bi + 1) + ": fetch failed (" + e.getMessage() + "). Skipping batch.");
                 Thread.sleep(Math.max(sleepMs, 500));
                 continue;
             }
 
-            int cap = Math.max(16, ids.size() * 2);
-            Map<Integer, int[]> normalized = new HashMap<>(cap);
-            Map<Integer, Integer> activity = new HashMap<>(cap);
+            // --- NEW: visibility counters for this batch ---
+            int apiReturned = priceEntries.size();
+            int apiNonZero = 0;
+            int apiZero = 0;
+            int boundCount = 0;
 
-            for (var p : priceEntries) {
+            // Pre-size maps to avoid rehash (load factor ~1.0 since we know size)
+            int expected = Math.max(16, ids.size());
+            Map<Integer, int[]> normalized = new HashMap<>(expected, 1.0f);
+            Map<Integer, Integer> activity = new HashMap<>(expected, 1.0f);
+
+            for (int i = 0; i < priceEntries.size(); i++) {
+                Gw2ApiClient.PriceEntry p = priceEntries.get(i);
                 int id = p.id();
+
                 int buyQty = (p.buys() == null ? 0 : Math.max(0, p.buys().quantity()));
                 int sellQty = (p.sells() == null ? 0 : Math.max(0, p.sells().quantity()));
                 int buyUnit = (p.buys() == null ? 0 : Math.max(0, p.buys().unitPrice()));
                 int sellUnit = (p.sells() == null ? 0 : Math.max(0, p.sells().unitPrice()));
 
+                if (buyUnit > 0 || sellUnit > 0)
+                    apiNonZero++;
+                else
+                    apiZero++;
+
+                boolean isAcctBound = Boolean.TRUE.equals(isBound.get(id));
+                if (isAcctBound)
+                    boundCount++;
+
                 activity.put(id, buyQty + sellQty);
                 normalized.put(id,
-                        Boolean.TRUE.equals(isBound.get(id)) ? new int[] { 0, 0 } : new int[] { buyUnit, sellUnit });
+                        isAcctBound ? new int[] { 0, 0 } : new int[] { buyUnit, sellUnit });
             }
-            for (Integer id : ids) { // ensure presence
+            // Ensure all ids are present (even if the API skipped some)
+            for (int i = 0; i < ids.size(); i++) {
+                int id = ids.get(i);
                 normalized.putIfAbsent(id, new int[] { 0, 0 });
                 activity.putIfAbsent(id, 0);
             }
 
+            // NEW: compute additional summary for the log
+            int normalizedNonZero = 0;
+            for (int[] ps : normalized.values()) {
+                if (ps[0] > 0 || ps[1] > 0)
+                    normalizedNonZero++;
+            }
+            int apiMissing = ids.size() - apiReturned;
+
             try {
-                TierPricesDao.upsertMulti(normalized, due10, due15, due60, activity);
+                // Upsert tier prices
+                TierPricesDao.upsertMulti(normalized, due15, due60, activity);
 
                 total5m += normalized.size();
-                if (!due10.isEmpty()) {
-                    total10m += due10.size();
-                    System.out.println("buy_10m & sell_10m updated for ids: " + formatIds(due10, 50));
-                }
                 if (!due15.isEmpty()) {
                     total15m += due15.size();
                     System.out.println("buy_15m & sell_15m updated for ids: " + formatIds(due15, 50));
@@ -113,42 +167,81 @@ public class RefreshTierPrices {
                     System.out.println("buy_60m & sell_60m updated for ids: " + formatIds(due60, 50));
                 }
 
-                if (!vendorMissing.isEmpty()) {
-                    Map<Integer, Integer> vendorToInsert = vendor.entrySet().stream()
-                            .filter(e -> vendorMissing.contains(e.getKey()))
-                            .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
+                // Vendor values (only for ones that were missing)
+                if (!vendorMissing.isEmpty() && !vendor.isEmpty()) {
+                    Map<Integer, Integer> vendorToInsert = new HashMap<>(vendorMissing.size());
+                    for (Map.Entry<Integer, Integer> e : vendor.entrySet()) {
+                        if (vendorMissing.contains(e.getKey())) {
+                            vendorToInsert.put(e.getKey(), e.getValue());
+                        }
+                    }
                     if (!vendorToInsert.isEmpty()) {
                         Gw2PricesDao.upsertVendorValuesIfChanged(vendorToInsert);
                         totalVendorUpdated += vendorToInsert.size();
                         System.out.println("vendor_value updated for ids: " + formatIds(vendorToInsert.keySet(), 50));
                     }
                 }
+
+                // image / rarity — only build maps we actually need
+                if (!items.isEmpty()) {
+                    if (needImages) {
+                        Map<Integer, String> imagesMap = Gw2ApiClient.itemImageUrlMap(items);
+                        if (!imagesMap.isEmpty()) {
+                            try {
+                                Gw2PricesDao.updateImagesIfChanged(imagesMap);
+                            } catch (Exception e) {
+                                System.err.println("Batch " + (bi + 1) + ": image update failed (" + e.getMessage()
+                                        + "). Continuing.");
+                            }
+                        }
+                    }
+                    if (needRarities) {
+                        Map<Integer, String> raritiesMap = Gw2ApiClient.itemRarityMap(items);
+                        if (!raritiesMap.isEmpty()) {
+                            try {
+                                Gw2PricesDao.updateRaritiesIfChanged(raritiesMap);
+                            } catch (Exception e) {
+                                System.err.println("Batch " + (bi + 1) + ": rarity update failed (" + e.getMessage()
+                                        + "). Continuing.");
+                            }
+                        }
+                    }
+                }
             } catch (Exception e) {
                 System.err.println("Batch " + (bi + 1) + ": DB upsert failed (" + e.getMessage() + ").");
             }
 
-            System.out.printf(Locale.ROOT, "  [%d/%d] batch done: 5m=%d, 10m+=%d, 15m+=%d, 60m+=%d%n",
-                    end, total, normalized.size(), due10.size(), due15.size(), due60.size());
+            System.out.printf(
+                    Locale.ROOT,
+                    "  [%d/%d] batch done: 5m=%d, 15m+=%d, 60m+=%d, itemsFetch=%s, apiPrices=%d, apiNonZero=%d, apiZero=%d, apiMissing=%d, normalizedNonZero=%d, bound=%d%n",
+                    end, total, normalized.size(), due15.size(), due60.size(),
+                    (needItemsIds.isEmpty() ? "skipped" : String.valueOf(needItemsIds.size())),
+                    apiReturned, apiNonZero, apiZero, apiMissing, normalizedNonZero, boundCount);
 
             if (end < total && sleepMs > 0) {
                 try {
                     Thread.sleep(sleepMs);
                 } catch (InterruptedException ignored) {
+                    Thread.currentThread().interrupt();
                 }
             }
         }
 
         System.out.println("Done. Summary:");
         System.out.println("  5m updated count = " + total5m);
-        System.out.println("  10m updated count = " + total10m);
         System.out.println("  15m updated count = " + total15m);
         System.out.println("  60m updated count = " + total60m);
         System.out.println("  vendor_value updated count = " + totalVendorUpdated);
+        System.out.printf(Locale.ROOT, "RefreshTierPrices done in %.1fs%n",
+                (System.currentTimeMillis() - runStart) / 1000.0);
 
-        return new Summary(total, total5m, total10m, total15m, total60m, totalVendorUpdated);
+        return new Summary(total, total5m, total15m, total60m, totalVendorUpdated);
     }
 
-    /** one-shot candidate picker with due flags for 10/15/60 + vendorMissing */
+    /**
+     * one-shot candidate picker with due flags for 15/60 + vendor/image/rarity
+     * missing
+     */
     private static List<DueRow> pickDueCandidates(Integer overallCap) {
         final int fastMin = 5, slowMin = 60;
         final int activityThreshold = Integer.parseInt(
@@ -156,43 +249,43 @@ public class RefreshTierPrices {
 
         return Jpa.tx(em -> {
             String sql = """
-                        WITH candidates AS (
-                          SELECT i.id,
-                                 t.ts_5m, t.ts_10m, t.ts_15m, t.ts_60m,
-                                 COALESCE(t.activity_last, 0) AS activity,
-                                 gp.vendor_value
-                          FROM public.items i
-                          LEFT JOIN public.gw2_prices_tiers t ON t.item_id = i.id
-                          LEFT JOIN public.gw2_prices      gp ON gp.item_id = i.id
-                          WHERE i.tradable = true
-                        )
-                        SELECT id,
-                               (ts_10m IS NULL OR ts_10m < now() - make_interval(mins := 10)) AS due10,
-                               (ts_15m IS NULL OR ts_15m < now() - make_interval(mins := 15)) AS due15,
-                               (ts_60m IS NULL OR ts_60m < now() - make_interval(mins := 60)) AS due60,
-                               (vendor_value IS NULL) AS vendorMissing
-                        FROM candidates
-                        WHERE
-                          vendor_value IS NULL
-                          OR
-                          ts_5m IS NULL
-                          OR ts_5m < now() - (
-                                CASE WHEN activity >= :thr
-                                     THEN make_interval(mins := :fast)
-                                     ELSE make_interval(mins := :slow)
-                                END
-                          )
-                          OR ts_10m IS NULL OR ts_10m < now() - make_interval(mins := 10)
-                          OR ts_15m IS NULL OR ts_15m < now() - make_interval(mins := 15)
-                          OR ts_60m IS NULL OR ts_60m < now() - make_interval(mins := 60)
-                        ORDER BY
-                          LEAST(
-                            COALESCE(ts_5m,  TIMESTAMP 'epoch'),
-                            COALESCE(ts_10m, TIMESTAMP 'epoch'),
-                            COALESCE(ts_15m, TIMESTAMP 'epoch'),
-                            COALESCE(ts_60m, TIMESTAMP 'epoch')
-                          ) ASC, id ASC
-                        %s
+                    WITH candidates AS (
+                      SELECT i.id,
+                             t.ts_5m, t.ts_15m, t.ts_60m,
+                             COALESCE(t.activity_last, 0) AS activity,
+                             gp.vendor_value, gp.image, gp.rarity
+                      FROM public.items i
+                      LEFT JOIN public.gw2_prices_tiers t ON t.item_id = i.id
+                      LEFT JOIN public.gw2_prices      gp ON gp.item_id = i.id
+                      WHERE i.tradable = true
+                    )
+                    SELECT id,
+                           (ts_15m IS NULL OR ts_15m < now() - make_interval(mins := 15)) AS due15,
+                           (ts_60m IS NULL OR ts_60m < now() - make_interval(mins := 60)) AS due60,
+                           (vendor_value IS NULL) AS vendorMissing,
+                           (image IS NULL) AS imageMissing,
+                           (rarity IS NULL) AS rarityMissing
+                    FROM candidates
+                    WHERE
+                      vendor_value IS NULL
+                      OR image IS NULL
+                      OR rarity IS NULL
+                      OR ts_5m IS NULL
+                      OR ts_5m < now() - (
+                            CASE WHEN activity >= :thr
+                                 THEN make_interval(mins := :fast)
+                                 ELSE make_interval(mins := :slow)
+                            END
+                      )
+                      OR ts_15m IS NULL OR ts_15m < now() - make_interval(mins := 15)
+                      OR ts_60m IS NULL OR ts_60m < now() - make_interval(mins := 60)
+                    ORDER BY
+                      LEAST(
+                        COALESCE(ts_5m,  TIMESTAMP 'epoch'),
+                        COALESCE(ts_15m, TIMESTAMP 'epoch'),
+                        COALESCE(ts_60m, TIMESTAMP 'epoch')
+                      ) ASC, id ASC
+                    %s
                     """.formatted(overallCap == null ? "" : "LIMIT :lim");
 
             var q = em.createNativeQuery(sql);
@@ -207,13 +300,18 @@ public class RefreshTierPrices {
             System.out.printf(Locale.ROOT, "Stale: picked=%d (thr=%d, fast=%dm, slow=%dm)%n",
                     rows.size(), activityThreshold, fastMin, slowMin);
 
-            return rows.stream()
-                    .map(r -> new DueRow(((Number) r[0]).intValue(),
-                            r[1] != null && (Boolean) r[1],
-                            r[2] != null && (Boolean) r[2],
-                            r[3] != null && (Boolean) r[3],
-                            r[4] != null && (Boolean) r[4]))
-                    .collect(Collectors.toList());
+            List<DueRow> out = new ArrayList<>(rows.size());
+            for (int i = 0; i < rows.size(); i++) {
+                Object[] r = rows.get(i);
+                out.add(new DueRow(
+                        ((Number) r[0]).intValue(),
+                        r[1] != null && (Boolean) r[1],
+                        r[2] != null && (Boolean) r[2],
+                        r[3] != null && (Boolean) r[3],
+                        r[4] != null && (Boolean) r[4],
+                        r[5] != null && (Boolean) r[5]));
+            }
+            return out;
         });
     }
 
@@ -260,30 +358,7 @@ public class RefreshTierPrices {
     }
 
     // --- helper holder
-    private record DueRow(int id, boolean due10, boolean due15, boolean due60, boolean vendorMissing) {
-    }
-
-    private static Integer parseLimit(String s) {
-        if (s == null)
-            return null;
-        String v = s.trim().toLowerCase(java.util.Locale.ROOT);
-        if (v.isEmpty() || v.equals("all") || v.equals("0"))
-            return null;
-        try {
-            int n = Integer.parseInt(v);
-            return (n <= 0) ? null : n;
-        } catch (Exception e) {
-            return null;
-        }
-    }
-
-    private static String arg(String[] args, String[] keys, String def) {
-        if (args != null) {
-            for (String a : args)
-                for (String k : keys)
-                    if (a.startsWith(k))
-                        return a.substring(k.length());
-        }
-        return def;
+    private record DueRow(int id, boolean due15, boolean due60, boolean vendorMissing, boolean imageMissing,
+            boolean rarityMissing) {
     }
 }

@@ -20,10 +20,6 @@ public class Gw2PricesDao {
                 buyCol = "buy_5m";
                 sellCol = "sell_5m";
             }
-            case "10m" -> {
-                buyCol = "buy_10m";
-                sellCol = "sell_10m";
-            }
             case "15m" -> {
                 buyCol = "buy_15m";
                 sellCol = "sell_15m";
@@ -123,4 +119,81 @@ public class Gw2PricesDao {
             em.createNativeQuery(sb.toString()).executeUpdate();
         });
     }
+
+    public static void updateImagesIfChanged(Map<Integer, String> images) {
+        if (images == null || images.isEmpty())
+            return;
+        Jpa.txVoid(em -> {
+            for (var e : images.entrySet()) {
+                em.createNativeQuery("""
+                            UPDATE public.gw2_prices
+                               SET image = :img
+                             WHERE item_id = :id
+                               AND (image IS DISTINCT FROM :img)
+                        """).setParameter("id", e.getKey())
+                        .setParameter("img", e.getValue())
+                        .executeUpdate();
+            }
+        });
+    }
+
+    public static void updateRaritiesIfChanged(Map<Integer, String> rarities) {
+        if (rarities == null || rarities.isEmpty())
+            return;
+        Jpa.txVoid(em -> {
+            for (var e : rarities.entrySet()) {
+                em.createNativeQuery("""
+                            UPDATE public.gw2_prices
+                               SET rarity = :rar
+                             WHERE item_id = :id
+                               AND (rarity IS DISTINCT FROM :rar)
+                        """).setParameter("id", e.getKey())
+                        .setParameter("rar", e.getValue())
+                        .executeUpdate();
+            }
+        });
+    }
+
+    public static Map<Integer, String> loadImageUrlsByIds(java.util.Collection<Integer> ids) {
+        if (ids == null || ids.isEmpty())
+            return java.util.Map.of();
+        String in = ids.stream().map(String::valueOf).collect(java.util.stream.Collectors.joining(","));
+        return Jpa.tx(em -> {
+            var rs = em.createNativeQuery("""
+                    SELECT item_id, image
+                      FROM public.gw2_prices
+                     WHERE item_id IN (""" + in + ")").getResultList();
+            java.util.Map<Integer, String> out = new java.util.HashMap<>();
+            for (Object row : rs) {
+                Object[] a = (Object[]) row;
+                Integer id = ((Number) a[0]).intValue();
+                String url = (String) a[1];
+                if (url != null && !url.isBlank())
+                    out.put(id, url);
+            }
+            return out;
+        });
+    }
+
+    public static Map<Integer, String> loadRaritiesByIds(java.util.Collection<Integer> ids) {
+        if (ids == null || ids.isEmpty())
+            return java.util.Map.of();
+        String in = ids.stream().map(String::valueOf).collect(java.util.stream.Collectors.joining(","));
+        return Jpa.tx(em -> {
+            var rs = em.createNativeQuery("""
+                    SELECT item_id, rarity
+                      FROM public.gw2_prices
+                     WHERE item_id IN (""" + in + ")").getResultList();
+            java.util.Map<Integer, String> out = new java.util.HashMap<>();
+            for (Object row : rs) {
+                Object[] a = (Object[]) row;
+                Integer id = ((Number) a[0]).intValue();
+                String rarity = (String) a[1];
+                if (rarity != null && !rarity.isBlank())
+                    out.put(id, rarity);
+            }
+            return out;
+        });
+    }
+
 }

@@ -2,9 +2,12 @@ package eu.fast.gw2.dao;
 
 import eu.fast.gw2.tools.Jpa;
 
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
 public class CalculationsDao {
 
-    // Added formulasJson at the end; kept your existing fields.
     public record Config(String category,
             String key,
             String operation,
@@ -13,9 +16,13 @@ public class CalculationsDao {
             String formulasJson) {
     }
 
+    /**
+     * Existing single (category,key) lookup – unchanged except for light typing
+     * cleanup.
+     */
     public static Config find(String category, String key) {
         return Jpa.tx(em -> {
-            var r = em.createNativeQuery("""
+            List<?> r = em.createNativeQuery("""
                       SELECT category,
                              key,
                              operation,
@@ -38,13 +45,15 @@ public class CalculationsDao {
             Object[] a = (Object[]) r.get(0);
 
             int taxes = 15;
-            if (a[3] instanceof Number n)
+            Object t = a[3];
+            if (t instanceof Number n)
                 taxes = n.intValue();
-            else if (a[3] != null)
+            else if (t != null) {
                 try {
-                    taxes = Integer.parseInt(a[3].toString());
+                    taxes = Integer.parseInt(t.toString());
                 } catch (Exception ignored) {
                 }
+            }
 
             return new Config(
                     (String) a[0], // category
@@ -54,6 +63,55 @@ public class CalculationsDao {
                     (String) a[4], // source_table_key
                     (String) a[5] // formulas_json
             );
+        });
+    }
+
+    /** Bulk-load latest row per (category,key) in one roundtrip. */
+    public static Map<String, Config> findAllLatest() {
+        // NOTE the explicit generic on Jpa.<Map<String,Config>>tx(...) – this fixes the
+        // type mismatch.
+        return Jpa.<Map<String, Config>>tx(em -> {
+            @SuppressWarnings("unchecked")
+            List<Object[]> rows = (List<Object[]>) em.createNativeQuery("""
+                        SELECT DISTINCT ON (category, key)
+                               category,
+                               key,
+                               operation,
+                               taxes,
+                               source_table_key,
+                               formulas_json
+                          FROM public.calculations
+                         ORDER BY category, key, id DESC
+                    """).getResultList();
+
+            Map<String, Config> out = new HashMap<>(Math.max(16, rows.size() * 2));
+
+            for (Object[] a : rows) {
+                String category = (String) a[0];
+                String key = (String) a[1];
+                String op = (String) a[2];
+
+                int taxes = 15;
+                Object t = a[3];
+                if (t instanceof Number n)
+                    taxes = n.intValue();
+                else if (t != null) {
+                    try {
+                        taxes = Integer.parseInt(t.toString());
+                    } catch (Exception ignored) {
+                    }
+                }
+
+                String source = (String) a[4];
+                String formulas = (String) a[5];
+
+                Config cfg = new Config(category, key, op, taxes, source, formulas);
+
+                String ck = ((category == null ? "" : category.trim().toUpperCase(java.util.Locale.ROOT))
+                        + "|" + (key == null ? "" : key.trim()));
+                out.put(ck, cfg);
+            }
+            return out;
         });
     }
 }
