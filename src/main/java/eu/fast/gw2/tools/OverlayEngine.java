@@ -1,21 +1,31 @@
 package eu.fast.gw2.tools;
 
-import java.util.*;
-import eu.fast.gw2.dao.OverlayDao;
-import eu.fast.gw2.dao.Gw2PricesDao;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
 import eu.fast.gw2.dao.CalculationsDao;
+import eu.fast.gw2.dao.Gw2PricesDao;
+import eu.fast.gw2.dao.OverlayDao;
 import eu.fast.gw2.enums.Tier;
 
 public class OverlayEngine {
 
-    /** Hard cap for profiling runs (override with -Doverlay.limit=50). 0 disables the cap. */
+    /**
+     * Hard cap for profiling runs (override with -Doverlay.limit=50). 0 disables
+     * the cap.
+     */
     private static final int RUN_LIMIT = Math.max(0, Integer.getInteger("overlay.limit", 50));
 
     // ---------------- public API ----------------
 
     public static void recomputeMain(String tableKey, Tier tier, boolean persist) {
         long start = System.currentTimeMillis();
-        System.out.printf(java.util.Locale.ROOT, "Overlay: recomputeMain name='%s' tier=%s%n", tableKey, tier.columnKey());
+        System.out.printf(java.util.Locale.ROOT, "Overlay: recomputeMain name='%s' tier=%s%n", tableKey,
+                tier.columnKey());
 
         String rowsJson = OverlayDBAccess.getMainRowsJson(tableKey);
         if (rowsJson == null || rowsJson.isBlank()) {
@@ -28,11 +38,11 @@ public class OverlayEngine {
         String tableCategory = OverlayHelper.dominantCategory(rows);
         var tableCfg = CalculationsDao.find(tableCategory, tableKey);
 
-        // batch preload detail rows for all referenced composite/internal refs
+        // Preload referenced detail rows (composite + internal)
         Set<String> detailKeys = collectDetailKeysForMain(rows);
         OverlayCache.preloadDetailRows(detailKeys);
 
-        // Collect IDs including composite/internal referenced detail tables
+        // Collect all needed item ids (leaf + ids from referenced details)
         Set<Integer> needed = collectAllNeededIdsForMain(rows, detailKeys);
         System.out.printf(java.util.Locale.ROOT, "  -> rows=%d, ids=%d%n", rows.size(), needed.size());
 
@@ -42,43 +52,39 @@ public class OverlayEngine {
 
         long sumBuy = 0, sumSell = 0;
 
-        // Per-row compute (qty = 1 for all)
-        for (var row : rows) {
-            String cat  = OverlayHelper.str(row.get(OverlayHelper.COL_CAT));
+        // Per-row compute (main does NOT multiply by qty; hours handled by
+        // writeProfitWithHour)
+        for (int i = 0; i < rows.size(); i++) {
+            var row = rows.get(i);
+
+            String cat = OverlayHelper.str(row.get(OverlayHelper.COL_CAT));
             String rkey = OverlayHelper.str(row.get(OverlayHelper.COL_KEY));
             int taxesPercent = OverlayCalc.pickTaxesPercent(cat, rkey, tableCfg);
 
-            if (OverlayHelper.isInternal(cat) && rkey != null && !rkey.isBlank()) {
-                var cfg = OverlayCalc.getCalcCfg(cat, rkey);
-                String refKey = (cfg != null && cfg.sourceTableKey() != null && !cfg.sourceTableKey().isBlank())
-                        ? cfg.sourceTableKey() : rkey;
-
-                int[] ev = OverlayCalc.evForDetail(refKey, priceMap, 0, tier.columnKey());
-                OverlayHelper.writeProfitWithHour(row, ev[0], ev[1]);
-
-            } else if (OverlayHelper.isCompositeRef(cat, rkey)) {
-                int[] ev = OverlayCalc.evForDetail(rkey, priceMap, taxesPercent, tier.columnKey());
-                OverlayHelper.writeProfitWithHour(row, ev[0], ev[1]);
-
-            } else {
-                int id = OverlayHelper.toInt(row.get(OverlayHelper.COL_ID), -1);
-                if (id > 0) {
-                    int[] ps = priceMap.getOrDefault(id, new int[] { 0, 0 });
-                    int buyNet = OverlayHelper.net(ps[0], taxesPercent);
-                    int sellNet = OverlayHelper.net(ps[1], taxesPercent);
-                    if (buyNet == 0 && sellNet == 0) {
-                        Integer vendor = OverlayCache.vendorValueCached(id);
-                        if (vendor != null) {
-                            buyNet = vendor; sellNet = vendor;
-                        }
-                    }
-                    OverlayHelper.writeProfitWithHour(row, buyNet, sellNet);
-                }
+            // Coin fast-path (Id == 1): profit equals AverageAmount
+            int __id = OverlayHelper.toInt(row.get(OverlayHelper.COL_ID), -1);
+            if (__id == 1) {
+                int amt = (int) Math.floor(OverlayHelper.toDouble(row.get(OverlayHelper.COL_AVG), 0.0));
+                OverlayHelper.writeProfitWithHour(row, amt, amt);
+                continue;
             }
 
-            Integer outBuy  = OverlayHelper.toIntBoxed(row.get(OverlayHelper.COL_TPB));
+            var eval = OverlayDslEngine.evaluateRowStrict(cat, rkey, row, tier, taxesPercent, priceMap);
+
+            if (eval != null) {
+                OverlayHelper.writeProfitWithHour(row, eval.buy(), eval.sell());
+            } else {
+                // STRICT MODE: no formulas_json — log & zero out to make gaps obvious
+                System.err.printf(java.util.Locale.ROOT,
+                        "Overlay STRICT(main): missing formulas for (category='%s', key='%s') in table='%s' row#%d name='%s'%n",
+                        String.valueOf(cat), String.valueOf(rkey), tableKey, i,
+                        String.valueOf(row.get(OverlayHelper.COL_NAME)));
+                OverlayHelper.writeProfitWithHour(row, 0, 0);
+            }
+
+            Integer outBuy = OverlayHelper.toIntBoxed(row.get(OverlayHelper.COL_TPB));
             Integer outSell = OverlayHelper.toIntBoxed(row.get(OverlayHelper.COL_TPS));
-            sumBuy  += (outBuy  == null ? 0 : outBuy);
+            sumBuy += (outBuy == null ? 0 : outBuy);
             sumSell += (outSell == null ? 0 : outSell);
         }
 
@@ -96,7 +102,10 @@ public class OverlayEngine {
                 sumBuy, sumSell, persist ? "yes" : "no", dur / 1000.0);
     }
 
-    /** Recompute one table (detail_tables) identified by (detailFeatureId, tableKey). */
+    /**
+     * Recompute one table (detail_tables) identified by (detailFeatureId,
+     * tableKey).
+     */
     public static void recompute(long detailFeatureId, String tableKey, Tier tier, boolean persist) {
         long start = System.currentTimeMillis();
         System.out.printf(java.util.Locale.ROOT, "Overlay: recompute detail fid=%d key='%s' tier=%s%n",
@@ -113,11 +122,11 @@ public class OverlayEngine {
         var tableCategory = OverlayHelper.dominantCategory(rows);
         var tableCfg = CalculationsDao.find(tableCategory, tableKey);
 
-        // batch preload detail rows for all referenced composite/internal refs
+        // Preload referenced detail rows (composite + internal)
         Set<String> detailKeys = collectDetailKeysForDetail(rows);
         OverlayCache.preloadDetailRows(detailKeys);
 
-        // Collect IDs including composite/internal referenced detail tables
+        // Collect all needed item ids (leaf + ids from referenced details)
         Set<Integer> needed = collectAllNeededIdsForDetail(rows, detailKeys);
         System.out.printf(java.util.Locale.ROOT, "  -> rows=%d, ids=%d%n", rows.size(), needed.size());
 
@@ -125,44 +134,35 @@ public class OverlayEngine {
                 ? new HashMap<>()
                 : Gw2PricesDao.loadTier(new ArrayList<>(needed), tier.columnKey());
 
-        // Recompute rows
-        for (var row : rows) {
-            String cat  = OverlayHelper.str(row.get(OverlayHelper.COL_CAT));
+        // Detail rows: multiply by AverageAmount after DSL
+        for (int i = 0; i < rows.size(); i++) {
+            var row = rows.get(i);
+
+            String cat = OverlayHelper.str(row.get(OverlayHelper.COL_CAT));
             String rkey = OverlayHelper.str(row.get(OverlayHelper.COL_KEY));
             int taxesPercent = OverlayCalc.pickTaxesPercent(cat, rkey, tableCfg);
 
-            if (OverlayHelper.isInternal(cat) && rkey != null && !rkey.isBlank()) {
-                var cfg = OverlayCalc.getCalcCfg(cat, rkey);
-                String refKey = (cfg != null && cfg.sourceTableKey() != null && !cfg.sourceTableKey().isBlank())
-                        ? cfg.sourceTableKey() : rkey;
+            // Coin fast-path (Id == 1): profit equals AverageAmount
+            int __id = OverlayHelper.toInt(row.get(OverlayHelper.COL_ID), -1);
+            if (__id == 1) {
+                int amt = (int) Math.floor(OverlayHelper.toDouble(row.get(OverlayHelper.COL_AVG), 0.0));
+                OverlayHelper.writeProfit(row, amt, amt);
+                continue;
+            }
 
-                int[] ev = OverlayCalc.evForDetail(refKey, priceMap, 0, tier.columnKey());
+            var eval = OverlayDslEngine.evaluateRowStrict(cat, rkey, row, tier, taxesPercent, priceMap);
+
+            if (eval != null) {
                 double qty = OverlayHelper.toDouble(row.get(OverlayHelper.COL_AVG), 1.0);
-                OverlayHelper.writeProfit(row, (int) Math.round(ev[0] * qty), (int) Math.round(ev[1] * qty));
-
-            } else if (OverlayHelper.isCompositeRef(cat, rkey)) {
-                int[] ev = OverlayCalc.evForDetail(rkey, priceMap, taxesPercent, tier.columnKey());
-                double qty = OverlayHelper.toDouble(row.get(OverlayHelper.COL_AVG), 1.0);
-                OverlayHelper.writeProfit(row, (int) Math.round(ev[0] * qty), (int) Math.round(ev[1] * qty));
-
+                OverlayHelper.writeProfit(row,
+                        (int) Math.round(eval.buy() * qty),
+                        (int) Math.round(eval.sell() * qty));
             } else {
-                int id = OverlayHelper.toInt(row.get(OverlayHelper.COL_ID), -1);
-                if (id > 0) {
-                    int[] ps = priceMap.getOrDefault(id, new int[] { 0, 0 });
-                    int buyNet = OverlayHelper.net(ps[0], taxesPercent);
-                    int sellNet = OverlayHelper.net(ps[1], taxesPercent);
-                    if (buyNet == 0 && sellNet == 0) {
-                        Integer vendor = OverlayCache.vendorValueCached(id);
-                        if (vendor != null) {
-                            buyNet = vendor; sellNet = vendor;
-                        }
-                    }
-                    double qty = OverlayHelper.toDouble(row.get(OverlayHelper.COL_AVG), 1.0);
-                    OverlayHelper.writeProfit(row, (int) Math.round(buyNet * qty), (int) Math.round(sellNet * qty));
-                } else if (OverlayHelper.isCoinRow(row)) {
-                    int amt = OverlayHelper.numericTotalAmount(row);
-                    OverlayHelper.writeProfit(row, amt, amt);
-                }
+                System.err.printf(java.util.Locale.ROOT,
+                        "Overlay STRICT(detail): missing formulas for (category='%s', key='%s') in table='%s' fid=%d row#%d name='%s'%n",
+                        String.valueOf(cat), String.valueOf(rkey), tableKey, detailFeatureId, i,
+                        String.valueOf(row.get(OverlayHelper.COL_NAME)));
+                OverlayHelper.writeProfit(row, 0, 0);
             }
         }
 
@@ -184,7 +184,8 @@ public class OverlayEngine {
     private static List<Map<String, Object>> recomputeDetailCore(long fid, String key, Tier tier) {
         long start = System.currentTimeMillis();
         String rowsJson = OverlayDBAccess.getDetailRowsJson(fid, key);
-        if (rowsJson == null || rowsJson.isBlank()) return List.of();
+        if (rowsJson == null || rowsJson.isBlank())
+            return List.of();
 
         List<Map<String, Object>> rows = OverlayJson.parseRows(rowsJson);
         var tableCategory = OverlayHelper.dominantCategory(rows);
@@ -199,45 +200,39 @@ public class OverlayEngine {
                 ? new HashMap<>()
                 : Gw2PricesDao.loadTier(new ArrayList<>(needed), tier.columnKey());
 
-        for (var row : rows) {
-            String cat  = OverlayHelper.str(row.get(OverlayHelper.COL_CAT));
+        for (int i = 0; i < rows.size(); i++) {
+            var row = rows.get(i);
+
+            String cat = OverlayHelper.str(row.get(OverlayHelper.COL_CAT));
             String rkey = OverlayHelper.str(row.get(OverlayHelper.COL_KEY));
             int taxesPercent = OverlayCalc.pickTaxesPercent(cat, rkey, tableCfg);
 
-            if (OverlayHelper.isCompositeRef(cat, rkey)) {
-                int[] ev = OverlayCalc.evForDetail(rkey, priceMap, taxesPercent, tier.columnKey());
+            // Coin fast-path (Id == 1): profit equals AverageAmount
+            int __id = OverlayHelper.toInt(row.get(OverlayHelper.COL_ID), -1);
+            if (__id == 1) {
+                int amt = (int) Math.floor(OverlayHelper.toDouble(row.get(OverlayHelper.COL_AVG), 0.0));
+                OverlayHelper.writeProfit(row, amt, amt);
+                continue;
+            }
+
+            var eval = OverlayDslEngine.evaluateRowStrict(cat, rkey, row, tier, taxesPercent, priceMap);
+
+            if (eval != null) {
                 double qty = OverlayHelper.toDouble(row.get(OverlayHelper.COL_AVG), 1.0);
-                OverlayHelper.writeProfit(row, (int) Math.round(ev[0] * qty), (int) Math.round(ev[1] * qty));
-
-            } else if (OverlayHelper.isInternal(cat) && rkey != null && !rkey.isBlank()) {
-                var cfg = OverlayCalc.getCalcCfg(cat, rkey);
-                String refKey = (cfg != null && cfg.sourceTableKey() != null && !cfg.sourceTableKey().isBlank())
-                        ? cfg.sourceTableKey() : rkey;
-
-                int[] ev = OverlayCalc.evForDetail(refKey, priceMap, 0, tier.columnKey());
-                double qty = OverlayHelper.toDouble(row.get(OverlayHelper.COL_AVG), 1.0);
-                OverlayHelper.writeProfit(row, (int) Math.round(ev[0] * qty), (int) Math.round(ev[1] * qty));
-
+                OverlayHelper.writeProfit(row,
+                        (int) Math.round(eval.buy() * qty),
+                        (int) Math.round(eval.sell() * qty));
             } else {
-                int id = OverlayHelper.toInt(row.get(OverlayHelper.COL_ID), -1);
-                if (id > 0) {
-                    int[] ps = priceMap.getOrDefault(id, new int[] { 0, 0 });
-                    int buyNet = OverlayHelper.net(ps[0], taxesPercent);
-                    int sellNet = OverlayHelper.net(ps[1], taxesPercent);
-                    if (buyNet == 0 && sellNet == 0) {
-                        Integer vendor = OverlayCache.vendorValueCached(id);
-                        if (vendor != null) { buyNet = vendor; sellNet = vendor; }
-                    }
-                    double qty = OverlayHelper.toDouble(row.get(OverlayHelper.COL_AVG), 1.0);
-                    OverlayHelper.writeProfit(row, (int) Math.round(buyNet * qty), (int) Math.round(sellNet * qty));
-                } else if (OverlayHelper.isCoinRow(row)) {
-                    int amt = OverlayHelper.numericTotalAmount(row);
-                    OverlayHelper.writeProfit(row, amt, amt);
-                }
+                System.err.printf(java.util.Locale.ROOT,
+                        "Overlay STRICT(detailCore): missing formulas for (category='%s', key='%s') key='%s' row#%d name='%s'%n",
+                        String.valueOf(cat), String.valueOf(rkey), key, i,
+                        String.valueOf(row.get(OverlayHelper.COL_NAME)));
+                OverlayHelper.writeProfit(row, 0, 0);
             }
         }
 
-        if (tableCfg != null) OverlayHelper.applyAggregation(rows, tableCfg.operation());
+        if (tableCfg != null)
+            OverlayHelper.applyAggregation(rows, tableCfg.operation());
 
         long dur = System.currentTimeMillis() - start;
         System.out.printf(java.util.Locale.ROOT, "    recomputeDetailCore key='%s' tier=%s rows=%d (%.1fs)%n",
@@ -249,7 +244,8 @@ public class OverlayEngine {
     private static List<Map<String, Object>> recomputeMainCore(String key, Tier tier) {
         long start = System.currentTimeMillis();
         String rowsJson = OverlayDBAccess.getMainRowsJson(key);
-        if (rowsJson == null || rowsJson.isBlank()) return List.of();
+        if (rowsJson == null || rowsJson.isBlank())
+            return List.of();
 
         List<Map<String, Object>> rows = OverlayJson.parseRows(rowsJson);
         String tableCategory = OverlayHelper.dominantCategory(rows);
@@ -264,39 +260,36 @@ public class OverlayEngine {
                 ? new HashMap<>()
                 : Gw2PricesDao.loadTier(new ArrayList<>(needed), tier.columnKey());
 
-        for (var row : rows) {
-            String cat  = OverlayHelper.str(row.get(OverlayHelper.COL_CAT));
+        for (int i = 0; i < rows.size(); i++) {
+            var row = rows.get(i);
+
+            String cat = OverlayHelper.str(row.get(OverlayHelper.COL_CAT));
             String rkey = OverlayHelper.str(row.get(OverlayHelper.COL_KEY));
             int taxesPercent = OverlayCalc.pickTaxesPercent(cat, rkey, tableCfg);
 
-            if (OverlayHelper.isCompositeRef(cat, rkey)) {
-                int[] ev = OverlayCalc.evForDetail(rkey, priceMap, taxesPercent, tier.columnKey());
-                OverlayHelper.writeProfitWithHour(row, ev[0], ev[1]);
+            // Coin fast-path (Id == 1): profit equals AverageAmount
+            int __id = OverlayHelper.toInt(row.get(OverlayHelper.COL_ID), -1);
+            if (__id == 1) {
+                int amt = (int) Math.floor(OverlayHelper.toDouble(row.get(OverlayHelper.COL_AVG), 0.0));
+                OverlayHelper.writeProfit(row, amt, amt);
+                continue;
+            }
 
-            } else if (OverlayHelper.isInternal(cat) && rkey != null && !rkey.isBlank()) {
-                var cfg = OverlayCalc.getCalcCfg(cat, rkey);
-                String refKey = (cfg != null && cfg.sourceTableKey() != null && !cfg.sourceTableKey().isBlank())
-                        ? cfg.sourceTableKey() : rkey;
+            var eval = OverlayDslEngine.evaluateRowStrict(cat, rkey, row, tier, taxesPercent, priceMap);
 
-                int[] ev = OverlayCalc.evForDetail(refKey, priceMap, 0, tier.columnKey());
-                OverlayHelper.writeProfitWithHour(row, ev[0], ev[1]);
-
+            if (eval != null) {
+                OverlayHelper.writeProfitWithHour(row, eval.buy(), eval.sell());
             } else {
-                int id = OverlayHelper.toInt(row.get(OverlayHelper.COL_ID), -1);
-                if (id > 0) {
-                    int[] ps = priceMap.getOrDefault(id, new int[] { 0, 0 });
-                    int buyNet = OverlayHelper.net(ps[0], taxesPercent);
-                    int sellNet = OverlayHelper.net(ps[1], taxesPercent);
-                    if (buyNet == 0 && sellNet == 0) {
-                        Integer vendor = OverlayCache.vendorValueCached(id);
-                        if (vendor != null) { buyNet = vendor; sellNet = vendor; }
-                    }
-                    OverlayHelper.writeProfitWithHour(row, buyNet, sellNet);
-                }
+                System.err.printf(java.util.Locale.ROOT,
+                        "Overlay STRICT(mainCore): missing formulas for (category='%s', key='%s') key='%s' row#%d name='%s'%n",
+                        String.valueOf(cat), String.valueOf(rkey), key, i,
+                        String.valueOf(row.get(OverlayHelper.COL_NAME)));
+                OverlayHelper.writeProfitWithHour(row, 0, 0);
             }
         }
 
-        if (tableCfg != null) OverlayHelper.applyAggregation(rows, tableCfg.operation());
+        if (tableCfg != null)
+            OverlayHelper.applyAggregation(rows, tableCfg.operation());
 
         long dur = System.currentTimeMillis() - start;
         System.out.printf(java.util.Locale.ROOT, "    recomputeMainCore key='%s' tier=%s rows=%d (%.1fs)%n",
@@ -305,7 +298,7 @@ public class OverlayEngine {
         return rows;
     }
 
-    // -------- public helpers (unchanged signatures) --------
+    // -------- public helpers --------
 
     public static String recomputeDetailJson(long fid, String key, Tier tier) {
         var rows = recomputeDetailCore(fid, key, tier);
@@ -329,10 +322,9 @@ public class OverlayEngine {
         recomputeAndPersistAllOverlays(tiers, sleepMs);
     }
 
-    @SuppressWarnings("unchecked")
     public static void recomputeAndPersistAllOverlays(Tier[] tiers, int sleepMs) {
         var detailTargets = OverlayDBAccess.listDetailTargets();
-        var mainTargets   = OverlayDBAccess.listMainTargets();
+        var mainTargets = OverlayDBAccess.listMainTargets();
 
         // limiter (optional)
         if (RUN_LIMIT > 0 && detailTargets.size() > RUN_LIMIT) {
@@ -369,7 +361,8 @@ public class OverlayEngine {
             }
             System.out.printf(java.util.Locale.ROOT, "  detail %s ok=%d fail=%d%n", t.name(), ok, fail);
             long tierDur = System.currentTimeMillis() - tierStart;
-            System.out.printf(java.util.Locale.ROOT, "Tier %s (detail) finished in %.1fs%n", t.name(), tierDur / 1000.0);
+            System.out.printf(java.util.Locale.ROOT, "Tier %s (detail) finished in %.1fs%n", t.name(),
+                    tierDur / 1000.0);
         }
 
         for (Tier t : tiers) {
@@ -398,9 +391,13 @@ public class OverlayEngine {
     }
 
     private static void sleepQuiet(int ms) {
-        if (ms <= 0) return;
-        try { Thread.sleep(ms); }
-        catch (InterruptedException ignored) { Thread.currentThread().interrupt(); }
+        if (ms <= 0)
+            return;
+        try {
+            Thread.sleep(ms);
+        } catch (InterruptedException ignored) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     // --------- local helpers (keys/ids) ---------
@@ -409,13 +406,10 @@ public class OverlayEngine {
         Set<String> keys = new HashSet<>();
         for (var row : rows) {
             String cat = OverlayHelper.str(row.get(OverlayHelper.COL_CAT));
-            String rk  = OverlayHelper.str(row.get(OverlayHelper.COL_KEY));
-            if (OverlayHelper.isCompositeRef(cat, rk)) {
+            String rk = OverlayHelper.str(row.get(OverlayHelper.COL_KEY));
+            if (rk != null && !rk.isBlank()
+                    && (OverlayHelper.isCompositeRef(cat, rk) || OverlayHelper.isInternal(cat))) {
                 keys.add(rk);
-            } else if (OverlayHelper.isInternal(cat) && rk != null && !rk.isBlank()) {
-                var cfg = OverlayCalc.getCalcCfg(cat, rk);
-                keys.add((cfg != null && cfg.sourceTableKey() != null && !cfg.sourceTableKey().isBlank())
-                        ? cfg.sourceTableKey() : rk);
             }
         }
         return keys;
@@ -427,15 +421,15 @@ public class OverlayEngine {
 
     private static Set<Integer> collectAllNeededIdsForMain(List<Map<String, Object>> rows, Set<String> preloadedKeys) {
         Set<Integer> needed = new HashSet<>(Math.max(16, rows.size() / 2));
-        // leaf ids
         for (var row : rows) {
-            String cat  = OverlayHelper.str(row.get(OverlayHelper.COL_CAT));
+            String cat = OverlayHelper.str(row.get(OverlayHelper.COL_CAT));
             String rkey = OverlayHelper.str(row.get(OverlayHelper.COL_KEY));
-            if (OverlayHelper.isCompositeRef(cat, rkey) || OverlayHelper.isInternal(cat)) continue;
+            if (OverlayHelper.isCompositeRef(cat, rkey) || OverlayHelper.isInternal(cat))
+                continue;
             int id = OverlayHelper.toInt(row.get(OverlayHelper.COL_ID), -1);
-            if (id > 0) needed.add(id);
+            if (id > 0)
+                needed.add(id);
         }
-        // ids from preloaded detail rows
         if (preloadedKeys != null) {
             for (String k : preloadedKeys) {
                 var drops = OverlayCache.getDetailRowsCached(k);
@@ -445,7 +439,8 @@ public class OverlayEngine {
         return needed;
     }
 
-    private static Set<Integer> collectAllNeededIdsForDetail(List<Map<String, Object>> rows, Set<String> preloadedKeys) {
+    private static Set<Integer> collectAllNeededIdsForDetail(List<Map<String, Object>> rows,
+            Set<String> preloadedKeys) {
         return collectAllNeededIdsForMain(rows, preloadedKeys);
     }
 }
