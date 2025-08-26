@@ -14,6 +14,7 @@ import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.Pattern;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -117,7 +118,8 @@ public class GoogleSheetsImporter {
             names = names.stream().filter(n -> !missingNamed.contains(n)).toList();
         }
 
-        System.out.printf(Locale.ROOT, "Starting Sheets import: %d ranges in DB%n", names.size());
+        final int totalRanges = names.size();
+        System.out.printf(Locale.ROOT, "Starting Sheets import: %d ranges in DB%n", totalRanges);
 
         // Optionally group by sheet (ranges like "SheetName!A1:B5")
         names = names.stream()
@@ -133,15 +135,16 @@ public class GoogleSheetsImporter {
         // Shared counters
         final int[] updDetail = { 0 }, updMain = { 0 }, insMain = { 0 }, skipped = { 0 };
 
+        final AtomicInteger startedRanges = new AtomicInteger(0);
         List<Future<?>> futures = new ArrayList<>();
         for (int ci = 0; ci < chunks.size(); ci++) {
             final int chunkIndex = ci;
             final List<String> chunk = chunks.get(ci);
 
             futures.add(pool.submit(() -> {
-                System.out.printf(Locale.ROOT, "Fetching chunk #%d (%d ranges) on %s...%n",
-                        chunkIndex, chunk.size(), Thread.currentThread().getName());
-                System.out.println(" ? Calling Google API for ranges: " + chunk);
+                int soFar = startedRanges.addAndGet(chunk.size());
+                System.out.printf(Locale.ROOT, "[%d / %d] Fetching chunk #%d on %s...%n",
+                        soFar, totalRanges, chunkIndex, Thread.currentThread().getName());
 
                 long t0 = System.currentTimeMillis();
                 BatchGetValuesResponse batch;
@@ -159,7 +162,7 @@ public class GoogleSheetsImporter {
                     return;
                 }
                 long t1 = System.currentTimeMillis();
-                System.out.printf(Locale.ROOT, " ← API returned for chunk #%d in %.1f s%n",
+                System.out.printf(Locale.ROOT, " ← Chunk #%d done in %.1f s%n",
                         chunkIndex, (t1 - t0) / 1000.0);
 
                 List<ValueRange> vrs = Optional.ofNullable(batch.getValueRanges()).orElse(Collections.emptyList());
