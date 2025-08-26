@@ -1,13 +1,23 @@
 package eu.fast.gw2.tools;
 
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+
 import eu.fast.gw2.dao.Gw2PricesDao;
+import eu.fast.gw2.enums.Tier;
 
 public class OverlayCache {
 
     private static final int DETAIL_CACHE_MAX = Integer.getInteger("overlay.detailCacheMax", 4096);
 
-    /** LRU cache for detail_tables.rows by key. */
+    // ---------- detail rows LRU ----------
     private static final LinkedHashMap<String, List<Map<String, Object>>> DETAIL_ROWS_CACHE = new LinkedHashMap<>(256,
             0.75f, true) {
         @Override
@@ -16,25 +26,22 @@ public class OverlayCache {
         }
     };
 
-    /** Cache for vendor values by item id. Allows null values. */
+    // ---------- EV CHM ----------
+    private static final java.util.concurrent.ConcurrentHashMap<String, int[]> EV_CACHE = new java.util.concurrent.ConcurrentHashMap<>();
+
+    // ---------- vendor cache ----------
     private static final Map<Integer, Integer> VENDOR_CACHE = new HashMap<>();
 
-    /** LRU cache for EV of detail tables per (tier|taxes|detailKey). */
-    private static final LinkedHashMap<String, int[]> EV_CACHE = new LinkedHashMap<>(512, 0.75f, true) {
-        @Override
-        protected boolean removeEldestEntry(Map.Entry<String, int[]> eldest) {
-            return size() > 4096;
-        }
-    };
+    // ---------- price/image/rarity caches (shared by whole run) ----------
+    private static final ConcurrentHashMap<String, ConcurrentHashMap<Integer, int[]>> PRICE_CACHE_BY_TIER = new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<Integer, String> IMAGE_CACHE = new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<Integer, String> RARITY_CACHE = new ConcurrentHashMap<>();
 
-    public static Integer vendorValueCached(int itemId) {
-        if (VENDOR_CACHE.containsKey(itemId))
-            return VENDOR_CACHE.get(itemId);
-        Integer v = Gw2PricesDao.vendorValueById(itemId);
-        VENDOR_CACHE.put(itemId, v); // may be null
-        return v;
-    }
+    // ---------- base rows caches for the run ----------
+    private static final Map<String, List<Map<String, Object>>> MAIN_ROWS_BASE = new ConcurrentHashMap<>();
+    private static final Map<String, List<Map<String, Object>>> DETAIL_ROWS_BASE = new ConcurrentHashMap<>();
 
+    // ----- EV cache accessors -----
     public static int[] getEv(String ck) {
         return EV_CACHE.get(ck);
     }
@@ -43,7 +50,16 @@ public class OverlayCache {
         EV_CACHE.put(ck, ev);
     }
 
-    /** Get (and lazily load) rows by detail key. */
+    // ----- vendor -----
+    public static Integer vendorValueCached(int itemId) {
+        if (VENDOR_CACHE.containsKey(itemId))
+            return VENDOR_CACHE.get(itemId);
+        Integer v = Gw2PricesDao.vendorValueById(itemId);
+        VENDOR_CACHE.put(itemId, v); // may be null
+        return v;
+    }
+
+    // ----- detail rows preload / fetch -----
     public static List<Map<String, Object>> getDetailRowsCached(String key) {
         if (key == null || key.isBlank())
             return List.of();
@@ -79,12 +95,136 @@ public class OverlayCache {
             String j = e.getValue();
             List<Map<String, Object>> rows = (j == null || j.isBlank()) ? List.of() : OverlayJson.parseRows(j);
             DETAIL_ROWS_CACHE.put(k, rows);
+            DETAIL_ROWS_BASE.put(k, rows); // mirror into BASE for run usage
             seen.add(k);
         }
-        // any gap is cached as empty
         for (String k : missing) {
-            if (!seen.contains(k))
+            if (!seen.contains(k)) {
                 DETAIL_ROWS_CACHE.put(k, List.of());
+                DETAIL_ROWS_BASE.put(k, List.of());
+            }
         }
+    }
+
+    // ----- preload main rows for a set of table names -----
+    public static int preloadMainRows(Collection<String> mainNames) {
+        if (mainNames == null || mainNames.isEmpty())
+            return 0;
+        int loaded = 0;
+        for (String name : mainNames) {
+            if (name == null || name.isBlank())
+                continue;
+            if (MAIN_ROWS_BASE.containsKey(name)) {
+                loaded++;
+                continue;
+            }
+            String rowsJson = OverlayDBAccess.getMainRowsJson(name);
+            if (rowsJson == null || rowsJson.isBlank()) {
+                MAIN_ROWS_BASE.put(name, List.of());
+            } else {
+                MAIN_ROWS_BASE.put(name, OverlayJson.parseRows(rowsJson));
+            }
+            loaded++;
+        }
+        return loaded;
+    }
+
+    public static List<Map<String, Object>> getBaseMainRows(String name) {
+        return MAIN_ROWS_BASE.get(name);
+    }
+
+    public static List<Map<String, Object>> getBaseDetailRows(String key) {
+        return DETAIL_ROWS_BASE.computeIfAbsent(key, OverlayCache::getDetailRowsCached);
+    }
+
+    // ----- collect all item ids from preloaded bases -----
+    public static Set<Integer> collectAllItemIdsFromPreloaded() {
+        Set<Integer> all = new HashSet<>(16384);
+        // from mains
+        for (var e : MAIN_ROWS_BASE.entrySet()) {
+            for (var row : e.getValue()) {
+                String cat = OverlayHelper.str(row.get(OverlayHelper.COL_CAT));
+                String key = OverlayHelper.str(row.get(OverlayHelper.COL_KEY));
+                if (OverlayHelper.isCompositeRef(cat, key) || OverlayHelper.isInternal(cat))
+                    continue;
+                int id = OverlayHelper.toInt(row.get(OverlayHelper.COL_ID), -1);
+                if (id > 0)
+                    all.add(id);
+            }
+        }
+        // from details
+        for (var e : DETAIL_ROWS_BASE.entrySet()) {
+            all.addAll(OverlayHelper.extractIds(e.getValue()));
+        }
+        return all;
+    }
+
+    // ----- price/image/rarity cache fillers -----
+    public static Map<Integer, int[]> getOrFillPriceCache(Set<Integer> ids, Tier tier) {
+        var cache = PRICE_CACHE_BY_TIER.computeIfAbsent(tier.columnKey(), k -> new ConcurrentHashMap<>());
+        if (ids != null && !ids.isEmpty()) {
+            ArrayList<Integer> missing = null;
+            for (Integer id : ids) {
+                if (id == null || id <= 0)
+                    continue;
+                if (!cache.containsKey(id)) {
+                    if (missing == null)
+                        missing = new ArrayList<>();
+                    missing.add(id);
+                }
+            }
+            if (missing != null && !missing.isEmpty()) {
+                cache.putAll(Gw2PricesDao.loadTier(missing, tier.columnKey()));
+            }
+        }
+        return cache;
+    }
+
+    public static Map<Integer, String> getOrFillImageCache(Set<Integer> ids) {
+        if (ids != null && !ids.isEmpty()) {
+            ArrayList<Integer> missing = null;
+            for (Integer id : ids) {
+                if (id == null || id <= 0)
+                    continue;
+                if (!IMAGE_CACHE.containsKey(id)) {
+                    if (missing == null)
+                        missing = new ArrayList<>();
+                    missing.add(id);
+                }
+            }
+            if (missing != null && !missing.isEmpty()) {
+                IMAGE_CACHE.putAll(Gw2PricesDao.loadImageUrlsByIds(new HashSet<>(missing)));
+            }
+        }
+        return IMAGE_CACHE;
+    }
+
+    public static Map<Integer, String> getOrFillRarityCache(Set<Integer> ids) {
+        if (ids != null && !ids.isEmpty()) {
+            ArrayList<Integer> missing = null;
+            for (Integer id : ids) {
+                if (id == null || id <= 0)
+                    continue;
+                if (!RARITY_CACHE.containsKey(id)) {
+                    if (missing == null)
+                        missing = new ArrayList<>();
+                    missing.add(id);
+                }
+            }
+            if (missing != null && !missing.isEmpty()) {
+                RARITY_CACHE.putAll(Gw2PricesDao.loadRaritiesByIds(new HashSet<>(missing)));
+            }
+        }
+        return RARITY_CACHE;
+    }
+
+    // ----- optional: clear per-run caches (call between runs if desired) -----
+    public static void clearRunCaches() {
+        // keep DETAIL_ROWS_CACHE & EV_CACHE (they’re useful across runs)
+        PRICE_CACHE_BY_TIER.clear();
+        IMAGE_CACHE.clear();
+        RARITY_CACHE.clear();
+        MAIN_ROWS_BASE.clear();
+        DETAIL_ROWS_BASE.clear();
     }
 }

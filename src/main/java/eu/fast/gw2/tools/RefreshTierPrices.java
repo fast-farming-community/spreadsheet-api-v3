@@ -105,7 +105,7 @@ public class RefreshTierPrices {
                 continue;
             }
 
-            // --- NEW: visibility counters for this batch ---
+            // --- visibility counters for this batch ---
             int apiReturned = priceEntries.size();
             int apiNonZero = 0;
             int apiZero = 0;
@@ -145,7 +145,7 @@ public class RefreshTierPrices {
                 activity.putIfAbsent(id, 0);
             }
 
-            // NEW: compute additional summary for the log
+            // compute additional summary for the log
             int normalizedNonZero = 0;
             for (int[] ps : normalized.values()) {
                 if (ps[0] > 0 || ps[1] > 0)

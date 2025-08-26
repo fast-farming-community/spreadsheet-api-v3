@@ -1,10 +1,10 @@
 package eu.fast.gw2.dao;
 
-import eu.fast.gw2.tools.Jpa;
-
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+
+import eu.fast.gw2.tools.Jpa;
 
 public class CalculationsDao {
 
@@ -16,10 +16,7 @@ public class CalculationsDao {
             String formulasJson) {
     }
 
-    /**
-     * Existing single (category,key) lookup – unchanged except for light typing
-     * cleanup.
-     */
+    /** Existing single (category,key) lookup. */
     public static Config find(String category, String key) {
         return Jpa.tx(em -> {
             List<?> r = em.createNativeQuery("""
@@ -68,8 +65,6 @@ public class CalculationsDao {
 
     /** Bulk-load latest row per (category,key) in one roundtrip. */
     public static Map<String, Config> findAllLatest() {
-        // NOTE the explicit generic on Jpa.<Map<String,Config>>tx(...) – this fixes the
-        // type mismatch.
         return Jpa.<Map<String, Config>>tx(em -> {
             @SuppressWarnings("unchecked")
             List<Object[]> rows = (List<Object[]>) em.createNativeQuery("""

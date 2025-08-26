@@ -20,7 +20,7 @@ public class RunPrices {
         System.out.println(">>> RunPrices starting…");
 
         // Refresh GW2 tier prices
-        RefreshTierPrices.refresh(null, GW2API_SLEEP_MS);
+        //RefreshTierPrices.refresh(null, GW2API_SLEEP_MS);
 
         // Recompute overlays (detail_tables + main tables) for all tiers
         OverlayEngine.recomputeAndPersistAllOverlays(TIERS, OVERLAY_SLEEP_MS);

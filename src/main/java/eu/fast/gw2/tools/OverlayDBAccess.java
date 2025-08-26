@@ -105,7 +105,6 @@ public class OverlayDBAccess {
                 out.put(k, rowsJson);
                 returned.add(k);
             }
-            // mark non-found as null (caller will cache empty list)
             for (String k : chunk) {
                 out.putIfAbsent(k, null);
             }

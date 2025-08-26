@@ -1,17 +1,22 @@
 package eu.fast.gw2.tools;
 
-import eu.fast.gw2.dao.CalculationsDao;
-
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Set;
+
+import eu.fast.gw2.dao.CalculationsDao;
 
 public class OverlayCalc {
 
     /** Cache for calculations by (category|key). Allows null values. */
     private static final Map<String, CalculationsDao.Config> CALC_CACHE = new HashMap<>();
     private static volatile boolean CALC_ALL_PRELOADED = false;
+
+    /** Alias so callers can just use preloadAll() */
+    public static void preloadAll() {
+        preloadAllCalcsIfNeeded();
+    }
 
     /** One-time bulk preload of the latest rows for all (category,key). */
     public static void preloadAllCalcsIfNeeded() {
