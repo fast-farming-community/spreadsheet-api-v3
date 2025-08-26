@@ -3,13 +3,13 @@ package eu.fast.gw2.tools;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.Set;
-import java.util.LinkedHashMap;
 import java.util.Objects;
+import java.util.Set;
 import java.util.stream.Collectors;
 
 import com.fasterxml.jackson.core.type.TypeReference;
@@ -27,7 +27,6 @@ import com.fasterxml.jackson.databind.ObjectMapper;
  * operation IS NULL).
  * - PRUNES ONLY rows previously auto-seeded by this tool (notes LIKE our
  * prefixes).
- * - Adds detailed logging + timings.
  */
 public class SeedCalculationsFromDetailTable {
 
@@ -43,7 +42,7 @@ public class SeedCalculationsFromDetailTable {
     private static final int DEFAULT_TAXES = 0;
 
     // Chunk sizes for batched VALUES statements
-    private static final int CHUNK_SIZE_UPSERT = 500; // safe for most PG param limits
+    private static final int CHUNK_SIZE_UPSERT = 500;
     private static final int CHUNK_SIZE_PRUNE = 800;
 
     public static void run() throws Exception {
@@ -53,7 +52,6 @@ public class SeedCalculationsFromDetailTable {
         // ---------- Phase 1: Read JSON rows from BOTH sources ----------
         Instant t0 = Instant.now();
         List<Object[]> detailTables = Jpa.tx(em -> {
-            @SuppressWarnings("unchecked")
             List<Object[]> rows = em.createNativeQuery("""
                         SELECT id, key, rows
                           FROM public.detail_tables
@@ -63,7 +61,6 @@ public class SeedCalculationsFromDetailTable {
         });
 
         List<Object[]> mainTables = Jpa.tx(em -> {
-            @SuppressWarnings("unchecked")
             List<Object[]> rows = em.createNativeQuery("""
                         SELECT id, name, rows
                           FROM public.tables
@@ -236,7 +233,7 @@ public class SeedCalculationsFromDetailTable {
         Log.info("Applied writes (%.3fs): inserted formulas=%d, updated formulas=%d, inserted ops=%d, updated ops=%d",
                 secSince(t4), insF, updF, insO, updO);
 
-        // ---------- Phase 6: Prune stale (only our prefixes) ----------
+        // ---------- Phase 6: Prune stale ----------
         Instant t5 = Instant.now();
         pruneStaleByPrefix(discoveredDslPairs, NOTES_PREFIX_DSL);
         pruneStaleByPrefix(discoveredTablePairs, NOTES_PREFIX_OPS);
@@ -420,33 +417,35 @@ public class SeedCalculationsFromDetailTable {
             return;
         }
 
-        // Delete in chunks using tuple IN over VALUES
+        // Delete in chunks using tuple IN over VALUES — all positional params
         int deletedTotal = 0;
         for (int i = 0; i < stale.size(); i += CHUNK_SIZE_PRUNE) {
             final List<Pair> chunk = stale.subList(i, Math.min(stale.size(), i + CHUNK_SIZE_PRUNE));
             deletedTotal += Jpa.tx(em -> {
                 String values = chunk.stream()
                         .map(p -> "(?::text, ?::text)")
-                        .collect(Collectors.joining(","));
+                        .collect(java.util.stream.Collectors.joining(","));
                 String sql = """
                             WITH doomed(category, key) AS (VALUES %s)
                             DELETE FROM public.calculations c
                              USING doomed
                              WHERE c.category = doomed.category
                                AND c.key = doomed.key
-                               AND c.notes LIKE :prefix
+                               AND c.notes LIKE ?::text
                         """.formatted(values);
-                var q = em.createNativeQuery(sql).setParameter("prefix", notesPrefix + "%");
+
+                var q = em.createNativeQuery(sql);
                 int idx = 1;
                 for (Pair p : chunk) {
                     q.setParameter(idx++, p.category());
                     q.setParameter(idx++, p.key());
                 }
+                q.setParameter(idx++, notesPrefix + "%");
                 return q.executeUpdate();
             });
         }
-
         Log.info("Prune(%s): deleted=%d", notesPrefix, deletedTotal);
+
     }
 
     // ---------- model helpers ----------
