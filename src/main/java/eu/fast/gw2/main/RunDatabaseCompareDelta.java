@@ -26,19 +26,31 @@ public class RunDatabaseCompareDelta {
         String urlProd = "jdbc:postgresql://localhost:5433/fast";
         String user = System.getenv("PG_USER");
         String pass = System.getenv("PG_PASS");
+        String tier = System.getenv().getOrDefault("DELTA_TIER", "60m");
 
         try (Connection cTest = DriverManager.getConnection(urlTest, user, pass);
                 Connection cProd = DriverManager.getConnection(urlProd, user, pass)) {
 
-            System.out.println(">>> Checking tables");
-            compare(cProd, cTest,
-                    "SELECT page_id::text || ':' || COALESCE(name,'') AS k, rows FROM public.tables",
+            System.out.println(">>> PROD tables vs TEST tables_overlay (tier=" + tier + ")");
+            compare(
+                    cProd, cTest,
+                    // PROD base tables (key by name)
+                    "SELECT COALESCE(name,'') AS k, rows FROM public.tables",
+                    rs -> rs.getString("k"),
+                    // TEST overlay tables (key by key, filter by tier)
+                    "SELECT COALESCE(key,'') AS k, rows FROM public.tables_overlay WHERE tier = '" + tier + "'",
                     rs -> rs.getString("k"));
 
-            System.out.println(">>> Checking detail_tables");
-            compare(cProd, cTest,
+            System.out.println(">>> PROD detail_tables vs TEST detail_tables_overlay (tier=" + tier + ")");
+            compare(
+                    cProd, cTest,
+                    // PROD base detail (fid:key)
                     "SELECT detail_feature_id || ':' || key AS k, rows FROM public.detail_tables",
-                    (rs) -> rs.getString("k"));
+                    rs -> rs.getString("k"),
+                    // TEST overlay detail (same composite key, filtered by tier)
+                    "SELECT detail_feature_id || ':' || key AS k, rows FROM public.detail_tables_overlay WHERE tier = '"
+                            + tier + "'",
+                    rs -> rs.getString("k"));
         }
     }
 
@@ -64,15 +76,14 @@ public class RunDatabaseCompareDelta {
         return out;
     }
 
-    private static void compare(Connection prod, Connection test, String sql, KeyFn keyFn) throws Exception {
-        Map<String, JsonNode> p = load(prod, sql, keyFn);
-        Map<String, JsonNode> t = load(test, sql, keyFn);
+    private static void compare(Connection prod, Connection test,
+            String sqlProd, KeyFn keyFnProd,
+            String sqlTest, KeyFn keyFnTest) throws Exception {
+        Map<String, JsonNode> p = load(prod, sqlProd, keyFnProd);
+        Map<String, JsonNode> t = load(test, sqlTest, keyFnTest);
 
         int ok = 0, diff = 0, missProd = 0, missTest = 0;
-
-        // Track distinct ignored headers we encountered (normalized)
         Set<String> ignoredHeadersSeen = new LinkedHashSet<>();
-
         Set<String> all = new HashSet<>();
         all.addAll(p.keySet());
         all.addAll(t.keySet());
@@ -96,9 +107,8 @@ public class RunDatabaseCompareDelta {
                     JsonNode a = i < jp.size() ? jp.get(i) : null;
                     JsonNode b = i < jt.size() ? jt.get(i) : null;
 
-                    if (rowsEqualAfterIgnore(a, b, ignoredHeadersSeen)) {
+                    if (rowsEqualAfterIgnore(a, b, ignoredHeadersSeen))
                         continue;
-                    }
 
                     if (!keyHasDiff) {
                         System.out.println("Δ key=" + k);
@@ -106,9 +116,9 @@ public class RunDatabaseCompareDelta {
                     }
 
                     if (a != null && b != null && a.isObject() && b.isObject()) {
+                        // Compare ONLY fields present in base row (avoid overlay-only wSS noise)
                         Set<String> fields = new LinkedHashSet<>();
                         a.fieldNames().forEachRemaining(fields::add);
-                        b.fieldNames().forEachRemaining(fields::add);
 
                         String id = a.has("Id") ? a.get("Id").asText()
                                 : (b.has("Id") ? b.get("Id").asText() : "?");
@@ -118,19 +128,14 @@ public class RunDatabaseCompareDelta {
                         for (String f : fields) {
                             if (markIfIgnored(f, ignoredHeadersSeen))
                                 continue;
-
-                            JsonNode va = a.get(f);
-                            JsonNode vb = b.get(f);
-
-                            if (equalsWithTolerance(va, vb))
+                            if (equalsWithTolerance(a.get(f), b.get(f)))
                                 continue;
 
                             System.out.printf(
                                     "  line %d (Id=%s, Name=\"%s\") field %s%n    prod=%s%n    test=%s%n",
-                                    i + 1, id, name, f, normalize(va), normalize(vb));
+                                    i + 1, id, name, f, normalize(a.get(f)), normalize(b.get(f)));
                         }
                     } else {
-                        // at least one row is non-object; show when not equal within tolerance
                         if (!equalsWithTolerance(a, b)) {
                             System.out.printf("  line %d differs (non-object rows)%n", i + 1);
                         }
@@ -151,7 +156,6 @@ public class RunDatabaseCompareDelta {
                 ok++;
         }
 
-        // Print summary with ignored header stats
         System.out.printf("Ignored headers matched (distinct): %d%n", ignoredHeadersSeen.size());
         if (!ignoredHeadersSeen.isEmpty()) {
             int shown = 0;
@@ -178,12 +182,12 @@ public class RunDatabaseCompareDelta {
                 return true;
             if (b.isObject())
                 return objectIsEffectivelyEmpty(b, ignoredHeadersSeen);
-            return normalize(b).isEmpty();
+            return isZeroOrEmpty(b);
         }
         if (b == null || b.isNull()) {
             if (a.isObject())
                 return objectIsEffectivelyEmpty(a, ignoredHeadersSeen);
-            return normalize(a).isEmpty();
+            return isZeroOrEmpty(a);
         }
 
         if (a.isObject() && b.isObject()) {
@@ -219,26 +223,26 @@ public class RunDatabaseCompareDelta {
     }
 
     private static boolean equalsWithTolerance(JsonNode a, JsonNode b) {
-        // Handle both-null / empty strings cases
+        // treat null/empty/"0"/0 as identical
+        if (isZeroOrEmpty(a) && isZeroOrEmpty(b))
+            return true;
+
         String sa = normalize(a);
         String sb = normalize(b);
 
-        // Try numeric compare with relative tolerance if both sides are numeric
         Double da = asDouble(a);
         Double db = asDouble(b);
         if (da != null && db != null) {
             if (Double.compare(da, db) == 0)
                 return true;
-            double ad = Math.abs(da);
-            double bd = Math.abs(db);
+            double ad = Math.abs(da), bd = Math.abs(db);
             double denom = Math.max(ad, bd);
             if (denom == 0.0)
-                return true; // both zero (already caught above, but safe)
+                return true; // both zero-ish
             double rel = Math.abs(da - db) / denom;
             return rel <= REL_TOL;
         }
 
-        // Fallback to string equality
         return Objects.equals(sa, sb);
     }
 
@@ -274,7 +278,16 @@ public class RunDatabaseCompareDelta {
         if (field == null)
             return false;
         String norm = normalizeHeaderName(field);
-        boolean ignore = norm.startsWith("item")
+        boolean isWSS = norm.equals("tpbuyprofitwss")
+                || norm.equals("tpsellprofitwss")
+                || norm.equals("tpbuyprofitwsshr")
+                || norm.equals("tpsellprofitwsshr")
+                || norm.equals("tpbuyprofit")
+                || norm.equals("tpsellprofit");
+        boolean ignore = isWSS
+                || norm.startsWith("item")
+                || norm.startsWith("image")
+                || norm.startsWith("rarity")
                 || norm.startsWith("bestchoice");
         if (ignore)
             ignoredHeadersSeen.add(norm);
@@ -284,4 +297,16 @@ public class RunDatabaseCompareDelta {
     private static String normalizeHeaderName(String field) {
         return field.trim().replaceAll("[^A-Za-z0-9]", "").toLowerCase(Locale.ROOT);
     }
+
+    private static boolean isZeroOrEmpty(JsonNode n) {
+        if (n == null || n.isNull())
+            return true;
+        // numeric or numeric-looking text -> treat ~0 as zero
+        Double d = asDouble(n);
+        if (d != null)
+            return Math.abs(d) <= 1e-9;
+        // otherwise, empty string counts as empty
+        return normalize(n).isEmpty();
+    }
+
 }
