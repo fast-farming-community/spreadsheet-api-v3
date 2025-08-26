@@ -62,6 +62,9 @@ public final class OverlayRowComputer {
                 OverlayHelper.writeProfitWithHour(row, amt, amt);
             else
                 OverlayHelper.writeProfit(row, amt, amt);
+
+            writeSpiritShardAugments(row, ctx);
+
             return;
         }
 
@@ -82,6 +85,9 @@ public final class OverlayRowComputer {
                     OverlayHelper.writeProfitWithHour(row, 0, 0);
                 else
                     OverlayHelper.writeProfit(row, 0, 0);
+
+                writeSpiritShardAugments(row, ctx);
+
                 if (prof != null)
                     prof.belowCutoff++;
                 return;
@@ -91,6 +97,9 @@ public final class OverlayRowComputer {
                 OverlayHelper.writeProfitWithHour(row, buy, sell);
             else
                 OverlayHelper.writeProfit(row, buy, sell);
+
+            writeSpiritShardAugments(row, ctx);
+
             if (prof != null)
                 prof.fastComposite++;
             return;
@@ -126,6 +135,9 @@ public final class OverlayRowComputer {
                     OverlayHelper.writeProfitWithHour(row, 0, 0);
                 else
                     OverlayHelper.writeProfit(row, 0, 0);
+
+                writeSpiritShardAugments(row, ctx);
+
                 if (prof != null)
                     prof.belowCutoff++;
                 return;
@@ -135,6 +147,9 @@ public final class OverlayRowComputer {
                 OverlayHelper.writeProfitWithHour(row, buy, sell);
             else
                 OverlayHelper.writeProfit(row, buy, sell);
+
+            writeSpiritShardAugments(row, ctx);
+
             if (prof != null)
                 prof.fastItem++;
             return;
@@ -157,6 +172,9 @@ public final class OverlayRowComputer {
                 OverlayHelper.writeProfitWithHour(row, 0, 0);
             else
                 OverlayHelper.writeProfit(row, 0, 0);
+
+            writeSpiritShardAugments(row, ctx);
+
             if (problems != null)
                 problems.record(ctx.isMain, ctx.tableKey, ctx.detailFeatureIdOrNull, rowIndex, row, taxesPct,
                         "missing_formulas");
@@ -168,11 +186,13 @@ public final class OverlayRowComputer {
             double sellRaw = eval.sell();
             if (buyRaw < MIN_COPPER && sellRaw < MIN_COPPER) {
                 OverlayHelper.writeProfitWithHour(row, 0, 0);
+                writeSpiritShardAugments(row, ctx);
                 if (prof != null)
                     prof.belowCutoff++;
                 return;
             }
             OverlayHelper.writeProfitWithHour(row, eval.buy(), eval.sell());
+            writeSpiritShardAugments(row, ctx);
             if (problems != null)
                 problems.recordIfZero(true, ctx.tableKey, ctx.detailFeatureIdOrNull, rowIndex, row, taxesPct,
                         "computed_zero");
@@ -182,6 +202,8 @@ public final class OverlayRowComputer {
             double sellRaw = eval.sell() * qty;
             if (buyRaw < MIN_COPPER && sellRaw < MIN_COPPER) {
                 OverlayHelper.writeProfit(row, 0, 0);
+                writeSpiritShardAugments(row, ctx);
+
                 if (prof != null)
                     prof.belowCutoff++;
                 return;
@@ -189,6 +211,7 @@ public final class OverlayRowComputer {
             int buyTotal = (int) Math.round(buyRaw);
             int sellTotal = (int) Math.round(sellRaw);
             OverlayHelper.writeProfit(row, buyTotal, sellTotal);
+            writeSpiritShardAugments(row, ctx);
             if (problems != null)
                 problems.recordIfZero(false, ctx.tableKey, ctx.detailFeatureIdOrNull, rowIndex, row, taxesPct,
                         "computed_zero");
@@ -210,6 +233,54 @@ public final class OverlayRowComputer {
         if (tps <= 0 || taxesPct <= 0)
             return Math.max(0, tps);
         return (int) Math.floor(tps * (100.0 - OverlayHelper.clampPercent(taxesPct)) / 100.0);
+    }
+
+    private static void writeSpiritShardAugments(Map<String, Object> row, ComputeContext ctx) {
+        // Read base (already written) – we may override to 0 for Id==23
+        int baseBuy = OverlayHelper.toInt(row.get(OverlayHelper.COL_TPB), 0);
+        int baseSell = OverlayHelper.toInt(row.get(OverlayHelper.COL_TPS), 0);
+
+        int itemId = OverlayHelper.toInt(row.get(OverlayHelper.COL_ID), -1);
+        boolean isSpiritShardRow = (itemId == 23);
+
+        // Shard unit pair for current tier
+        int[] shard = OverlaySpiritShard.getShardUnitPair(ctx.tier, ctx.priceByItemId);
+        int shardBuyUnit = (shard == null || shard.length < 1) ? 0 : Math.max(0, shard[0]);
+        int shardSellUnit = (shard == null || shard.length < 2) ? 0 : Math.max(0, shard[1]);
+
+        // Delta = AverageAmount × shardUnit (per row)
+        double avg = OverlayHelper.toDouble(row.get(OverlayHelper.COL_AVG), 1.0);
+        int deltaBuy = (int) Math.round(avg * shardBuyUnit);
+        int deltaSell = (int) Math.round(avg * shardSellUnit);
+
+        // Spirit Shard row: base must be zeroed
+        if (isSpiritShardRow) {
+            baseBuy = 0;
+            baseSell = 0;
+            if (ctx.isMain) {
+                // also zero Hr base if present
+                row.put(OverlayHelper.COL_TPB_HR, 0);
+                row.put(OverlayHelper.COL_TPS_HR, 0);
+            }
+            // overwrite the base columns to 0 to be explicit
+            row.put(OverlayHelper.COL_TPB, 0);
+            row.put(OverlayHelper.COL_TPS, 0);
+        }
+
+        // Write wSS base columns (always present in both detail & main)
+        int TPBuyProfitwSS = Math.max(0, baseBuy + deltaBuy);
+        int TPSellProfitwSS = Math.max(0, baseSell + deltaSell);
+        row.put("TPBuyProfitwSS", TPBuyProfitwSS);
+        row.put("TPSellProfitwSS", TPSellProfitwSS);
+
+        // Per-hour only for main tables
+        if (ctx.isMain) {
+            double hours = OverlayHelper.toDouble(row.get(OverlayHelper.COL_HOURS), 0.0);
+            int TPBuyProfitwSSHr = (hours > 0.0) ? (int) Math.floor(TPBuyProfitwSS / hours) : TPBuyProfitwSS;
+            int TPSellProfitwSSHr = (hours > 0.0) ? (int) Math.floor(TPSellProfitwSS / hours) : TPSellProfitwSS;
+            row.put("TPBuyProfitwSSHr", TPBuyProfitwSSHr);
+            row.put("TPSellProfitwSSHr", TPSellProfitwSSHr);
+        }
     }
 
 }

@@ -29,6 +29,12 @@ public class OverlayHelper {
     public static final String COL_TPS_HR = "TPSellProfitHr";
     public static final String COL_HOURS = "Duration";
 
+    // Column names (Spirit Shard augments)
+    public static final String COL_TPB_WSS = "TPBuyProfitwSS";
+    public static final String COL_TPS_WSS = "TPSellProfitwSS";
+    public static final String COL_TPB_WSS_HR = "TPBuyProfitwSSHr";
+    public static final String COL_TPS_WSS_HR = "TPSellProfitwSSHr";
+
     public static String str(Object o) {
         return o == null ? null : String.valueOf(o);
     }
@@ -147,6 +153,12 @@ public class OverlayHelper {
         var buyHr = new ArrayList<Integer>();
         var sellHr = new ArrayList<Integer>();
 
+        // wSS collectors
+        var buyWSS = new ArrayList<Integer>();
+        var sellWSS = new ArrayList<Integer>();
+        var buyWSSHr = new ArrayList<Integer>();
+        var sellWSSHr = new ArrayList<Integer>();
+
         for (var query : rows) {
             Integer b = toIntBoxed(query.get(COL_TPB));
             Integer s = toIntBoxed(query.get(COL_TPS));
@@ -171,9 +183,35 @@ public class OverlayHelper {
                 buyHr.add(bh);
             if (sh != null)
                 sellHr.add(sh);
+
+            // -------- collect wSS --------
+            Integer bwss = toIntBoxed(query.get(COL_TPB_WSS));
+            Integer swss = toIntBoxed(query.get(COL_TPS_WSS));
+            if (bwss != null)
+                buyWSS.add(bwss);
+            if (swss != null)
+                sellWSS.add(swss);
+
+            Integer bwssHr = query.containsKey(COL_TPB_WSS_HR) ? toIntBoxed(query.get(COL_TPB_WSS_HR)) : null;
+            Integer swssHr = query.containsKey(COL_TPS_WSS_HR) ? toIntBoxed(query.get(COL_TPS_WSS_HR)) : null;
+
+            if (bwssHr == null || swssHr == null) {
+                double hours = toDouble(query.get(COL_HOURS), 0.0);
+                if (hours > 0.0) {
+                    if (bwssHr == null && bwss != null)
+                        bwssHr = (int) Math.floor(bwss / hours);
+                    if (swssHr == null && swss != null)
+                        swssHr = (int) Math.floor(swss / hours);
+                }
+            }
+            if (bwssHr != null)
+                buyWSSHr.add(bwssHr);
+            if (swssHr != null)
+                sellWSSHr.add(swssHr);
         }
 
-        if (buyBase.isEmpty() && sellBase.isEmpty() && buyHr.isEmpty() && sellHr.isEmpty())
+        if (buyBase.isEmpty() && sellBase.isEmpty() && buyHr.isEmpty() && sellHr.isEmpty()
+                && buyWSS.isEmpty() && sellWSS.isEmpty() && buyWSSHr.isEmpty() && sellWSSHr.isEmpty())
             return;
 
         String agg = (op == null ? "SUM" : op.toUpperCase(java.util.Locale.ROOT));
@@ -192,6 +230,12 @@ public class OverlayHelper {
         int aggSellBase = AGG.apply(sellBase);
         Integer aggBuyHr = buyHr.isEmpty() ? null : AGG.apply(buyHr);
         Integer aggSellHr = sellHr.isEmpty() ? null : AGG.apply(sellHr);
+
+        // wSS aggregates
+        Integer aggBuyWSS = buyWSS.isEmpty() ? null : AGG.apply(buyWSS);
+        Integer aggSellWSS = sellWSS.isEmpty() ? null : AGG.apply(sellWSS);
+        Integer aggBuyWSSHr = buyWSSHr.isEmpty() ? null : AGG.apply(buyWSSHr);
+        Integer aggSellWSSHr = sellWSSHr.isEmpty() ? null : AGG.apply(sellWSSHr);
 
         Map<String, Object> total = rows.stream()
                 .filter(q -> "TOTAL".equalsIgnoreCase(str(q.get(COL_KEY)))
@@ -212,7 +256,17 @@ public class OverlayHelper {
         if (aggSellHr != null)
             total.put(COL_TPS_HR, aggSellHr);
 
-        // ---------- BestChoice: for any op == MAX ----------
+        // write wSS totals
+        if (aggBuyWSS != null)
+            total.put(COL_TPB_WSS, aggBuyWSS);
+        if (aggSellWSS != null)
+            total.put(COL_TPS_WSS, aggSellWSS);
+        if (aggBuyWSSHr != null)
+            total.put(COL_TPB_WSS_HR, aggBuyWSSHr);
+        if (aggSellWSSHr != null)
+            total.put(COL_TPS_WSS_HR, aggSellWSSHr);
+
+        // ---------- BestChoice (unchanged; based on base columns only) ----------
         if ("MAX".equals(agg)) {
             String bestBuyName = null;
             String bestSellName = null;
@@ -220,7 +274,6 @@ public class OverlayHelper {
             int bestSellVal = Integer.MIN_VALUE;
 
             for (var r : rows) {
-                // skip TOTAL
                 String rName = str(r.get(COL_NAME));
                 if ("TOTAL".equalsIgnoreCase(rName))
                     continue;
@@ -247,9 +300,7 @@ public class OverlayHelper {
                 total.put(COL_BEST_SELL, bestSellName);
             else
                 total.remove(COL_BEST_SELL);
-
         } else {
-            // If op != MAX, make sure we don't keep stale BestChoice fields.
             total.remove(COL_BEST_BUY);
             total.remove(COL_BEST_SELL);
         }
