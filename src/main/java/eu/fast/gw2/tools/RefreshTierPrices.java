@@ -90,7 +90,6 @@ public class RefreshTierPrices {
 
                 // /items only if there is any vendor/image/rarity gap
                 if (!needItemsIds.isEmpty()) {
-                    // no sorting needed
                     List<Integer> needList = new ArrayList<>(needItemsIds.size());
                     needList.addAll(needItemsIds);
                     items = withRetry(() -> Gw2ApiClient.fetchItemsBatch(needList), 3, sleepMs, "items");
@@ -105,13 +104,7 @@ public class RefreshTierPrices {
                 continue;
             }
 
-            // --- visibility counters for this batch ---
-            int apiReturned = priceEntries.size();
-            int apiNonZero = 0;
-            int apiZero = 0;
-            int boundCount = 0;
-
-            // Pre-size maps to avoid rehash (load factor ~1.0 since we know size)
+            // Pre-size maps to avoid rehash
             int expected = Math.max(16, ids.size());
             Map<Integer, int[]> normalized = new HashMap<>(expected, 1.0f);
             Map<Integer, Integer> activity = new HashMap<>(expected, 1.0f);
@@ -125,18 +118,9 @@ public class RefreshTierPrices {
                 int buyUnit = (p.buys() == null ? 0 : Math.max(0, p.buys().unitPrice()));
                 int sellUnit = (p.sells() == null ? 0 : Math.max(0, p.sells().unitPrice()));
 
-                if (buyUnit > 0 || sellUnit > 0)
-                    apiNonZero++;
-                else
-                    apiZero++;
-
-                boolean isAcctBound = Boolean.TRUE.equals(isBound.get(id));
-                if (isAcctBound)
-                    boundCount++;
-
+                boolean acctBound = Boolean.TRUE.equals(isBound.get(id));
                 activity.put(id, buyQty + sellQty);
-                normalized.put(id,
-                        isAcctBound ? new int[] { 0, 0 } : new int[] { buyUnit, sellUnit });
+                normalized.put(id, acctBound ? new int[] { 0, 0 } : new int[] { buyUnit, sellUnit });
             }
             // Ensure all ids are present (even if the API skipped some)
             for (int i = 0; i < ids.size(); i++) {
@@ -145,27 +129,13 @@ public class RefreshTierPrices {
                 activity.putIfAbsent(id, 0);
             }
 
-            // compute additional summary for the log
-            int normalizedNonZero = 0;
-            for (int[] ps : normalized.values()) {
-                if (ps[0] > 0 || ps[1] > 0)
-                    normalizedNonZero++;
-            }
-            int apiMissing = ids.size() - apiReturned;
-
             try {
                 // Upsert tier prices
                 TierPricesDao.upsertMulti(normalized, due15, due60, activity);
 
                 total5m += normalized.size();
-                if (!due15.isEmpty()) {
-                    total15m += due15.size();
-                    System.out.println("buy_15m & sell_15m updated for ids: " + formatIds(due15, 50));
-                }
-                if (!due60.isEmpty()) {
-                    total60m += due60.size();
-                    System.out.println("buy_60m & sell_60m updated for ids: " + formatIds(due60, 50));
-                }
+                total15m += due15.size();
+                total60m += due60.size();
 
                 // Vendor values (only for ones that were missing)
                 if (!vendorMissing.isEmpty() && !vendor.isEmpty()) {
@@ -178,7 +148,6 @@ public class RefreshTierPrices {
                     if (!vendorToInsert.isEmpty()) {
                         Gw2PricesDao.upsertVendorValuesIfChanged(vendorToInsert);
                         totalVendorUpdated += vendorToInsert.size();
-                        System.out.println("vendor_value updated for ids: " + formatIds(vendorToInsert.keySet(), 50));
                     }
                 }
 
@@ -189,9 +158,7 @@ public class RefreshTierPrices {
                         if (!imagesMap.isEmpty()) {
                             try {
                                 Gw2PricesDao.updateImagesIfChanged(imagesMap);
-                            } catch (Exception e) {
-                                System.err.println("Batch " + (bi + 1) + ": image update failed (" + e.getMessage()
-                                        + "). Continuing.");
+                            } catch (Exception ignored) {
                             }
                         }
                     }
@@ -200,9 +167,7 @@ public class RefreshTierPrices {
                         if (!raritiesMap.isEmpty()) {
                             try {
                                 Gw2PricesDao.updateRaritiesIfChanged(raritiesMap);
-                            } catch (Exception e) {
-                                System.err.println("Batch " + (bi + 1) + ": rarity update failed (" + e.getMessage()
-                                        + "). Continuing.");
+                            } catch (Exception ignored) {
                             }
                         }
                     }
@@ -211,29 +176,25 @@ public class RefreshTierPrices {
                 System.err.println("Batch " + (bi + 1) + ": DB upsert failed (" + e.getMessage() + ").");
             }
 
-            System.out.printf(
-                    Locale.ROOT,
-                    "  [%d/%d] batch done: 5m=%d, 15m+=%d, 60m+=%d, itemsFetch=%s, apiPrices=%d, apiNonZero=%d, apiZero=%d, apiMissing=%d, normalizedNonZero=%d, bound=%d%n",
-                    end, total, normalized.size(), due15.size(), due60.size(),
-                    (needItemsIds.isEmpty() ? "skipped" : String.valueOf(needItemsIds.size())),
-                    apiReturned, apiNonZero, apiZero, apiMissing, normalizedNonZero, boundCount);
+            // --- concise batch line only ---
+            System.out.printf(Locale.ROOT,
+                    "  [%d/%d] batch done: 5m=%d, 15m+=%d, 60m+=%d%n",
+                    end, total, normalized.size(), due15.size(), due60.size());
 
             if (end < total && sleepMs > 0) {
                 try {
                     Thread.sleep(sleepMs);
-                } catch (InterruptedException ignored) {
+                } catch (InterruptedException ie) {
                     Thread.currentThread().interrupt();
                 }
             }
         }
 
-        System.out.println("Done. Summary:");
-        System.out.println("  5m updated count = " + total5m);
-        System.out.println("  15m updated count = " + total15m);
-        System.out.println("  60m updated count = " + total60m);
-        System.out.println("  vendor_value updated count = " + totalVendorUpdated);
-        System.out.printf(Locale.ROOT, "RefreshTierPrices done in %.1fs%n",
-                (System.currentTimeMillis() - runStart) / 1000.0);
+        System.out.println(String.format(
+                Locale.ROOT,
+                "Updated RefreshTierPrices: 5m=%d, 15m=%d, 60m=%d, vendor=%d (%.1fs)",
+                total5m, total15m, total60m, totalVendorUpdated,
+                (System.currentTimeMillis() - runStart) / 1000.0));
 
         return new Summary(total, total5m, total15m, total60m, totalVendorUpdated);
     }
@@ -313,18 +274,6 @@ public class RefreshTierPrices {
             }
             return out;
         });
-    }
-
-    // ---- logging helpers
-    private static String formatIds(Iterable<Integer> ids, int max) {
-        var list = new java.util.ArrayList<Integer>();
-        for (Integer i : ids)
-            list.add(i);
-        java.util.Collections.sort(list);
-        if (list.size() <= max)
-            return list.toString();
-        var head = list.subList(0, max);
-        return head.toString().replace("]", "") + ", ...(+" + (list.size() - max) + " more)]";
     }
 
     // ---- retry helper
