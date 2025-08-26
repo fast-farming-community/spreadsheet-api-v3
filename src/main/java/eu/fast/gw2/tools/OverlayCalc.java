@@ -12,6 +12,22 @@ public class OverlayCalc {
     /** Cache for calculations by (category|key). Allows null values. */
     private static final Map<String, CalculationsDao.Config> CALC_CACHE = new HashMap<>();
     private static volatile boolean CALC_ALL_PRELOADED = false;
+    private static final ThreadLocal<java.util.Set<Integer>> ACTIVE_IGNORES = new ThreadLocal<>();
+
+    static java.util.Set<Integer> activeIgnores() {
+        java.util.Set<Integer> s = ACTIVE_IGNORES.get();
+        return (s == null) ? java.util.Set.of() : s;
+    }
+
+    /** Run a block with a temporary ignore set; always clears after. */
+    public static <T> T withIgnoredIds(java.util.Set<Integer> ids, java.util.function.Supplier<T> body) {
+        ACTIVE_IGNORES.set((ids == null) ? java.util.Set.of() : java.util.Set.copyOf(ids));
+        try {
+            return body.get();
+        } finally {
+            ACTIVE_IGNORES.remove();
+        }
+    }
 
     /** Alias so callers can just use preloadAll() */
     public static void preloadAll() {

@@ -124,4 +124,24 @@ public class OverlayDBAccess {
             return query.isEmpty() ? null : (String) query.get(0);
         });
     }
+
+    public static java.util.Set<Integer> listIgnoredItemIdsByGroups(java.util.Collection<String> groups) {
+        if (groups == null || groups.isEmpty())
+            return java.util.Set.of();
+        String in = groups.stream()
+                .filter(g -> g != null && !g.isBlank())
+                .map(g -> "'" + g.replace("'", "''") + "'")
+                .collect(java.util.stream.Collectors.joining(","));
+        String sql = """
+                SELECT item_id
+                  FROM public.overlay_ignored_items
+                 WHERE group_label IN (%s)
+                """.formatted(in);
+        @SuppressWarnings("unchecked")
+        java.util.List<Number> rows = Jpa.tx(em -> em.createNativeQuery(sql).getResultList());
+        java.util.Set<Integer> out = new java.util.HashSet<>(rows.size());
+        for (Number n : rows)
+            out.add(n.intValue());
+        return out;
+    }
 }

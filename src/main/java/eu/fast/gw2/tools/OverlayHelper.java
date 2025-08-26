@@ -1,6 +1,12 @@
 package eu.fast.gw2.tools;
 
-import java.util.*;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
 public class OverlayHelper {
 
@@ -15,6 +21,8 @@ public class OverlayHelper {
     public static final String COL_TPB = "TPBuyProfit";
     public static final String COL_TPS = "TPSellProfit";
     public static final String COL_TOTAL_AMOUNT = "TotalAmount";
+    public static final String COL_BEST_BUY = "BestChoiceBuy";
+    public static final String COL_BEST_SELL = "BestChoiceSell";
 
     // Column names (tables - main)
     public static final String COL_TPB_HR = "TPBuyProfitHr";
@@ -168,7 +176,7 @@ public class OverlayHelper {
         if (buyBase.isEmpty() && sellBase.isEmpty() && buyHr.isEmpty() && sellHr.isEmpty())
             return;
 
-        String agg = (op == null ? "SUM" : op.toUpperCase());
+        String agg = (op == null ? "SUM" : op.toUpperCase(java.util.Locale.ROOT));
         java.util.function.Function<List<Integer>, Integer> AGG = xs -> {
             if (xs == null || xs.isEmpty())
                 return 0;
@@ -203,6 +211,48 @@ public class OverlayHelper {
             total.put(COL_TPB_HR, aggBuyHr);
         if (aggSellHr != null)
             total.put(COL_TPS_HR, aggSellHr);
+
+        // ---------- BestChoice: for any op == MAX ----------
+        if ("MAX".equals(agg)) {
+            String bestBuyName = null;
+            String bestSellName = null;
+            int bestBuyVal = Integer.MIN_VALUE;
+            int bestSellVal = Integer.MIN_VALUE;
+
+            for (var r : rows) {
+                // skip TOTAL
+                String rName = str(r.get(COL_NAME));
+                if ("TOTAL".equalsIgnoreCase(rName))
+                    continue;
+
+                Integer b = toIntBoxed(r.get(COL_TPB));
+                if (b != null && b > bestBuyVal) {
+                    bestBuyVal = b;
+                    bestBuyName = (rName != null && !rName.isBlank()) ? rName : str(r.get(COL_KEY));
+                }
+
+                Integer s = toIntBoxed(r.get(COL_TPS));
+                if (s != null && s > bestSellVal) {
+                    bestSellVal = s;
+                    bestSellName = (rName != null && !rName.isBlank()) ? rName : str(r.get(COL_KEY));
+                }
+            }
+
+            if (bestBuyName != null && !bestBuyName.isBlank())
+                total.put(COL_BEST_BUY, bestBuyName);
+            else
+                total.remove(COL_BEST_BUY);
+
+            if (bestSellName != null && !bestSellName.isBlank())
+                total.put(COL_BEST_SELL, bestSellName);
+            else
+                total.remove(COL_BEST_SELL);
+
+        } else {
+            // If op != MAX, make sure we don't keep stale BestChoice fields.
+            total.remove(COL_BEST_BUY);
+            total.remove(COL_BEST_SELL);
+        }
     }
 
     private static int sum(List<Integer> xs) {
