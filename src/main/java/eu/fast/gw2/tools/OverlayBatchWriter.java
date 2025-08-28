@@ -119,20 +119,19 @@ public final class OverlayBatchWriter implements AutoCloseable {
     private void flushMains() {
         if (mainBuf.isEmpty())
             return;
-
         final int n = mainBuf.size();
-        final StringBuilder sb = new StringBuilder(256 + n * 24);
+        final StringBuilder sb = new StringBuilder(256 + n * 32);
         sb.append("""
-                    INSERT INTO public.tables_overlay(key, tier, rows, updated_at)
+                    INSERT INTO public.tables_overlay(page_id, key, tier, rows, updated_at)
                     VALUES
                 """);
         for (int i = 0; i < n; i++) {
             if (i > 0)
                 sb.append(',');
-            sb.append("(?,?,CAST(? AS jsonb), now())");
+            sb.append("(?,?,?,CAST(? AS jsonb), now())");
         }
         sb.append("""
-                    ON CONFLICT (key, tier) DO UPDATE
+                    ON CONFLICT (page_id, key, tier) DO UPDATE
                     SET rows = EXCLUDED.rows, updated_at = now()
                     WHERE public.tables_overlay.rows IS DISTINCT FROM EXCLUDED.rows
                 """);
@@ -142,13 +141,17 @@ public final class OverlayBatchWriter implements AutoCloseable {
             Query q = em.createNativeQuery(sql);
             int p = 1;
             for (MainRow m : mainBuf) {
-                q.setParameter(p++, m.key);
+                int bar = m.key.indexOf('|');
+                int pageId = Integer.parseInt(m.key.substring(0, bar));
+                String name = m.key.substring(bar + 1);
+                q.setParameter(p++, pageId);
+                q.setParameter(p++, name); // goes to 'key' column
                 q.setParameter(p++, m.tier);
                 q.setParameter(p++, m.json);
             }
             q.executeUpdate();
         });
-
         mainBuf.clear();
     }
+
 }

@@ -86,7 +86,6 @@ public class SeedCalculationsFromDetailTable {
         // ---------- 4) Load existing calculations once ----------
         Instant t3 = Instant.now();
         Map<Pair, Existing> existingCalc = Jpa.tx(em -> {
-            @SuppressWarnings("unchecked")
             List<Object[]> rows = em.createNativeQuery("""
                         SELECT category, key,
                                (formulas_json IS NOT NULL) AS has_fjson,
@@ -254,7 +253,6 @@ public class SeedCalculationsFromDetailTable {
     private static Set<Pair> loadDbPairs() {
         // INTERNAL: feature/page from main structure
         Set<Pair> internal = Jpa.tx(em -> {
-            @SuppressWarnings("unchecked")
             List<?> rows = em.createNativeQuery("""
                         SELECT CONCAT(f.name,'/', p.name) AS k
                           FROM public.tables t
@@ -268,7 +266,6 @@ public class SeedCalculationsFromDetailTable {
 
         // DETAIL: (category,key) from detail_* structure
         Set<Pair> detail = Jpa.tx(em -> {
-            @SuppressWarnings("unchecked")
             List<Object[]> rows = em.createNativeQuery("""
                         SELECT df.name AS category, dt.key
                           FROM public.detail_tables dt

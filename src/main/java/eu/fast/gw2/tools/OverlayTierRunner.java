@@ -15,7 +15,7 @@ public final class OverlayTierRunner implements Runnable {
 
     private final Tier t;
     private final List<Object[]> detailTargets;
-    private final List<String> mainTargets;
+    private final List<String> mainTargets; // entries are "pageId|name"
     private final OverlayUpsertQueue writer;
     private final OverlayProblemLog problems;
     private final boolean profile;
@@ -153,9 +153,9 @@ public final class OverlayTierRunner implements Runnable {
         System.out.println("Overlay TIER " + t.name() + " MAIN: start");
 
         priceMap = OverlayCache.getOrFillPriceCache(Collections.emptySet(), t);
-        for (String name : mainTargets) {
+        for (String compositeKey : mainTargets) { // "pageId|name"
             try {
-                List<Map<String, Object>> base = OverlayCache.getBaseMainRows(name);
+                List<Map<String, Object>> base = OverlayCache.getBaseMainRows(compositeKey);
                 if (base == null)
                     continue;
 
@@ -166,26 +166,27 @@ public final class OverlayTierRunner implements Runnable {
                     prof.rowsMain += rows.size();
 
                 String tableCategory = OverlayHelper.dominantCategory(rows);
-                var tableConfig = OverlayCalc.getCalcCfg(tableCategory, name);
+                var tableConfig = OverlayCalc.getCalcCfg(tableCategory, compositeKey);
 
-                var ctx = new OverlayRowComputer.ComputeContext(true, t, name, null, tableConfig,
+                var ctx = new OverlayRowComputer.ComputeContext(true, t, compositeKey, null, tableConfig,
                         priceMap,
                         OverlayCache.getOrFillImageCache(Collections.emptySet()),
                         OverlayCache.getOrFillRarityCache(Collections.emptySet()));
 
                 if (profile)
-                    prof.tableBegin(name, true, rows.size(), ++mainIndex, Math.max(totalMainPlanned, 1));
+                    prof.tableBegin(compositeKey, true, rows.size(), ++mainIndex, Math.max(totalMainPlanned, 1));
                 for (int i = 0; i < rows.size(); i++)
                     OverlayRowComputer.computeRow(rows.get(i), ctx, i, prof, problems);
                 if (tableConfig != null)
                     OverlayHelper.applyAggregation(rows, tableConfig.operation());
 
-                writer.enqueueMain(name, t.label, OverlayJson.toJson(rows));
+                // enqueue with composite "pageId|name"
+                writer.enqueueMain(compositeKey, t.label, OverlayJson.toJson(rows));
                 ok++;
             } catch (Exception e) {
                 fail++;
-                System.err.printf("Overlay TIER %s MAIN: ! name='%s' -> %s: %s%n",
-                        t.name(), name, e.getClass().getSimpleName(),
+                System.err.printf("Overlay TIER %s MAIN: ! key='%s' -> %s: %s%n",
+                        t.name(), compositeKey, e.getClass().getSimpleName(),
                         (e.getMessage() == null ? "<no message>" : e.getMessage()));
             }
         }

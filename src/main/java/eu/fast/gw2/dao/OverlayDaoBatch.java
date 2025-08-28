@@ -8,22 +8,30 @@ import jakarta.persistence.Query;
 public class OverlayDaoBatch {
 
     /** Returns affected rows (inserted + updated). */
-    public static int batchUpsertMain(List<MainWrite> batch) {
-        if (batch == null || batch.isEmpty())
+    public static int batchUpsertMain(List<Integer> pageIds,
+            List<String> names,
+            List<String> tiers,
+            List<String> jsons) {
+        if (pageIds == null || names == null || tiers == null || jsons == null
+                || pageIds.size() != names.size()
+                || pageIds.size() != tiers.size()
+                || pageIds.size() != jsons.size()
+                || pageIds.isEmpty()) {
             return 0;
+        }
 
-        final StringBuilder sb = new StringBuilder(256 + batch.size() * 32);
+        final StringBuilder sb = new StringBuilder(256 + pageIds.size() * 40);
         sb.append("""
-                    INSERT INTO public.tables_overlay (key, tier, rows, updated_at)
+                    INSERT INTO public.tables_overlay (page_id, key, tier, rows, updated_at)
                     VALUES
                 """);
-        for (int i = 0; i < batch.size(); i++) {
+        for (int i = 0; i < pageIds.size(); i++) {
             if (i > 0)
                 sb.append(',');
-            sb.append("(?,?,CAST(? AS jsonb), now())");
+            sb.append("(?,?,?,CAST(? AS jsonb), now())");
         }
         sb.append("""
-                    ON CONFLICT (key, tier) DO UPDATE
+                    ON CONFLICT (page_id, key, tier) DO UPDATE
                     SET rows = EXCLUDED.rows, updated_at = now()
                     WHERE public.tables_overlay.rows IS DISTINCT FROM EXCLUDED.rows
                 """);
@@ -32,10 +40,11 @@ public class OverlayDaoBatch {
         return Jpa.tx(em -> {
             Query q = em.createNativeQuery(sql);
             int p = 1;
-            for (MainWrite w : batch) {
-                q.setParameter(p++, w.name());
-                q.setParameter(p++, w.tier());
-                q.setParameter(p++, w.json());
+            for (int i = 0; i < pageIds.size(); i++) {
+                q.setParameter(p++, pageIds.get(i));
+                q.setParameter(p++, names.get(i));
+                q.setParameter(p++, tiers.get(i));
+                q.setParameter(p++, jsons.get(i));
             }
             return q.executeUpdate();
         });

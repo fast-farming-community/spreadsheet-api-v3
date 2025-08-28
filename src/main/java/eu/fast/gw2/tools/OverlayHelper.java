@@ -266,7 +266,7 @@ public class OverlayHelper {
         if (aggSellWSSHr != null)
             total.put(COL_TPS_WSS_HR, aggSellWSSHr);
 
-        // ---------- BestChoice (unchanged; based on base columns only) ----------
+        // ---------- BestChoice ----------
         if ("MAX".equals(agg)) {
             String bestBuyName = null;
             String bestSellName = null;

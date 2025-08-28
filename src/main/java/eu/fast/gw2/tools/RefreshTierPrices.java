@@ -256,7 +256,6 @@ public class RefreshTierPrices {
             if (overallCap != null)
                 q.setParameter("lim", overallCap);
 
-            @SuppressWarnings("unchecked")
             List<Object[]> rows = q.getResultList();
             System.out.printf(Locale.ROOT, "Stale: picked=%d (thr=%d, fast=%dm, slow=%dm)%n",
                     rows.size(), activityThreshold, fastMin, slowMin);

@@ -25,7 +25,7 @@ public final class OverlayUpsertQueue implements AutoCloseable {
     private static final class Upsert {
         final boolean isMain;
         final long fid;
-        final String keyOrName;
+        final String keyOrName; // detail: key, main: "pageId|name"
         final String tier;
         final String json;
 
@@ -38,6 +38,7 @@ public final class OverlayUpsertQueue implements AutoCloseable {
         }
 
         String dedupeKey() {
+            // keep composite key for mains to dedupe correctly across pages
             return isMain ? ("M|" + keyOrName + "|" + tier) : ("D|" + fid + "|" + keyOrName + "|" + tier);
         }
     }
@@ -74,9 +75,12 @@ public final class OverlayUpsertQueue implements AutoCloseable {
                         uniq.put(u.dedupeKey(), u);
 
                     if (useBatch) {
+                        // --- batch buffers ---
+                        List<Integer> mainPageIds = new ArrayList<>();
                         List<String> mainNames = new ArrayList<>();
                         List<String> mainTiers = new ArrayList<>();
                         List<String> mainJsons = new ArrayList<>();
+
                         List<Long> detFids = new ArrayList<>();
                         List<String> detKeys = new ArrayList<>();
                         List<String> detTiers = new ArrayList<>();
@@ -84,7 +88,20 @@ public final class OverlayUpsertQueue implements AutoCloseable {
 
                         for (Upsert u : uniq.values()) {
                             if (u.isMain) {
-                                mainNames.add(u.keyOrName);
+                                // keyOrName is "pageId|name"
+                                int bar = (u.keyOrName == null) ? -1 : u.keyOrName.indexOf('|');
+                                int pageId;
+                                String name;
+                                if (bar > 0) {
+                                    pageId = safeParseInt(u.keyOrName.substring(0, bar), 0);
+                                    name = u.keyOrName.substring(bar + 1);
+                                } else {
+                                    // fallback: unknown page → 0, keep entire as name
+                                    pageId = 0;
+                                    name = u.keyOrName;
+                                }
+                                mainPageIds.add(pageId);
+                                mainNames.add(name);
                                 mainTiers.add(u.tier);
                                 mainJsons.add(u.json);
                             } else {
@@ -97,7 +114,8 @@ public final class OverlayUpsertQueue implements AutoCloseable {
 
                         try {
                             if (!mainNames.isEmpty())
-                                flushed += OverlayDao.upsertMainBatch(mainNames, mainTiers, mainJsons);
+                                // REQUIRE: OverlayDao has overload that accepts pageIds
+                                flushed += OverlayDao.upsertMainBatch(mainPageIds, mainNames, mainTiers, mainJsons);
                             if (!detKeys.isEmpty())
                                 flushed += OverlayDao.upsertDetailBatch(detFids, detKeys, detTiers, detJsons);
                         } catch (Throwable batchEx) {
@@ -105,10 +123,22 @@ public final class OverlayUpsertQueue implements AutoCloseable {
                                     .println("Overlay WRITER: batch failed; fallback per-row: " + batchEx.getMessage());
                             for (Upsert u : uniq.values()) {
                                 try {
-                                    if (u.isMain)
-                                        OverlayDao.upsertMain(u.keyOrName, u.tier, u.json);
-                                    else
+                                    if (u.isMain) {
+                                        int bar = (u.keyOrName == null) ? -1 : u.keyOrName.indexOf('|');
+                                        int pageId;
+                                        String name;
+                                        if (bar > 0) {
+                                            pageId = safeParseInt(u.keyOrName.substring(0, bar), 0);
+                                            name = u.keyOrName.substring(bar + 1);
+                                        } else {
+                                            pageId = 0;
+                                            name = u.keyOrName;
+                                        }
+                                        // REQUIRE: OverlayDao has per-row overload with pageId
+                                        OverlayDao.upsertMain(pageId, name, u.tier, u.json);
+                                    } else {
                                         OverlayDao.upsertDetail(u.fid, u.keyOrName, u.tier, u.json);
+                                    }
                                     flushed++;
                                 } catch (Exception e) {
                                     System.err.printf("Overlay WRITER: upsert failed (%s/%s): %s%n",
@@ -119,10 +149,22 @@ public final class OverlayUpsertQueue implements AutoCloseable {
                     } else {
                         for (Upsert u : uniq.values()) {
                             try {
-                                if (u.isMain)
-                                    OverlayDao.upsertMain(u.keyOrName, u.tier, u.json);
-                                else
+                                if (u.isMain) {
+                                    int bar = (u.keyOrName == null) ? -1 : u.keyOrName.indexOf('|');
+                                    int pageId;
+                                    String name;
+                                    if (bar > 0) {
+                                        pageId = safeParseInt(u.keyOrName.substring(0, bar), 0);
+                                        name = u.keyOrName.substring(bar + 1);
+                                    } else {
+                                        pageId = 0;
+                                        name = u.keyOrName;
+                                    }
+                                    // REQUIRE: OverlayDao has per-row overload with pageId
+                                    OverlayDao.upsertMain(pageId, name, u.tier, u.json);
+                                } else {
                                     OverlayDao.upsertDetail(u.fid, u.keyOrName, u.tier, u.json);
+                                }
                                 flushed++;
                             } catch (Exception e) {
                                 System.err.printf("Overlay WRITER: upsert failed (%s/%s): %s%n",
@@ -146,8 +188,8 @@ public final class OverlayUpsertQueue implements AutoCloseable {
         thread.start();
     }
 
-    public void enqueueMain(String name, String tierLabel, String json) {
-        q.offer(new Upsert(true, 0L, name, tierLabel, json));
+    public void enqueueMain(String compositeKey /* 'pageId|name' */, String tierLabel, String json) {
+        q.offer(new Upsert(true, 0L, compositeKey, tierLabel, json));
     }
 
     public void enqueueDetail(long fid, String key, String tierLabel, String json) {
@@ -163,6 +205,16 @@ public final class OverlayUpsertQueue implements AutoCloseable {
             } catch (InterruptedException ie) {
                 Thread.currentThread().interrupt();
             }
+        }
+    }
+
+    // ---------- helpers ----------
+
+    private static int safeParseInt(String s, int def) {
+        try {
+            return Integer.parseInt(s.trim());
+        } catch (Exception ignored) {
+            return def;
         }
     }
 }

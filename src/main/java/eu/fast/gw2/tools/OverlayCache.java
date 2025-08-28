@@ -107,30 +107,27 @@ public class OverlayCache {
     }
 
     // ----- preload main rows for a set of table names -----
-    public static int preloadMainRows(Collection<String> mainNames) {
-        if (mainNames == null || mainNames.isEmpty())
+    public static int preloadMainRows(Collection<String> mainKeys) {
+        if (mainKeys == null || mainKeys.isEmpty())
             return 0;
         int loaded = 0;
-        for (String name : mainNames) {
-            if (name == null || name.isBlank())
+        for (String key : mainKeys) {
+            if (key == null || key.isBlank())
                 continue;
-            if (MAIN_ROWS_BASE.containsKey(name)) {
+            if (MAIN_ROWS_BASE.containsKey(key)) {
                 loaded++;
                 continue;
             }
-            String rowsJson = OverlayDBAccess.getMainRowsJson(name);
-            if (rowsJson == null || rowsJson.isBlank()) {
-                MAIN_ROWS_BASE.put(name, List.of());
-            } else {
-                MAIN_ROWS_BASE.put(name, OverlayJson.parseRows(rowsJson));
-            }
+            String rowsJson = OverlayDBAccess.getMainRowsJson(key);
+            MAIN_ROWS_BASE.put(key,
+                    (rowsJson == null || rowsJson.isBlank()) ? List.of() : OverlayJson.parseRows(rowsJson));
             loaded++;
         }
         return loaded;
     }
 
-    public static List<Map<String, Object>> getBaseMainRows(String name) {
-        return MAIN_ROWS_BASE.get(name);
+    public static List<Map<String, Object>> getBaseMainRows(String compositeKey) {
+        return MAIN_ROWS_BASE.get(compositeKey);
     }
 
     public static List<Map<String, Object>> getBaseDetailRows(String key) {
@@ -193,7 +190,22 @@ public class OverlayCache {
                 }
             }
             if (missing != null && !missing.isEmpty()) {
-                IMAGE_CACHE.putAll(Gw2PricesDao.loadImageUrlsByIds(new HashSet<>(missing)));
+                // split: currencies (<200) vs items (>=200)
+                java.util.Set<Integer> cur = new java.util.HashSet<>();
+                java.util.Set<Integer> itm = new java.util.HashSet<>();
+                for (Integer id : missing) {
+                    if (id < 200)
+                        cur.add(id);
+                    else
+                        itm.add(id);
+                }
+                if (!itm.isEmpty()) {
+                    IMAGE_CACHE.putAll(Gw2PricesDao.loadImageUrlsByIds(new java.util.HashSet<>(itm)));
+                }
+                if (!cur.isEmpty()) {
+                    // NEW: fetch proper currency icons
+                    IMAGE_CACHE.putAll(Gw2PricesDao.loadCurrencyIconsByIds(new java.util.HashSet<>(cur)));
+                }
             }
         }
         return IMAGE_CACHE;
@@ -212,7 +224,21 @@ public class OverlayCache {
                 }
             }
             if (missing != null && !missing.isEmpty()) {
-                RARITY_CACHE.putAll(Gw2PricesDao.loadRaritiesByIds(new HashSet<>(missing)));
+                // split again: no rarity for currencies (<200)
+                java.util.Set<Integer> cur = new java.util.HashSet<>();
+                java.util.Set<Integer> itm = new java.util.HashSet<>();
+                for (Integer id : missing) {
+                    if (id < 200)
+                        cur.add(id);
+                    else
+                        itm.add(id);
+                }
+                if (!itm.isEmpty()) {
+                    RARITY_CACHE.putAll(Gw2PricesDao.loadRaritiesByIds(new java.util.HashSet<>(itm)));
+                }
+                // For currencies we intentionally do NOT set any rarity -> leave absent
+                // (If you want explicit empty, you could put "", but current computeRow only
+                // writes when non-blank)
             }
         }
         return RARITY_CACHE;

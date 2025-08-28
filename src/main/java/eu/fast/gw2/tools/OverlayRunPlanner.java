@@ -13,14 +13,12 @@ public final class OverlayRunPlanner {
 
     /** Preloads calcs, targets, base rows, and warms caches for all tiers. */
     public static Plan plan(Tier[] tiers) {
-        // 1) Preload formulas
+        // Preload formulas
         OverlayCalc.preloadAll();
-
-        // 2) Targets
         var detailTargets = OverlayDBAccess.listDetailTargets();
         var mainTargets = OverlayDBAccess.listMainTargets();
 
-        // 3) Preload base rows used by this run
+        // preload
         Set<String> allDetailKeys = new HashSet<>();
         for (Object[] r : detailTargets) {
             String key = (String) r[1];
@@ -30,7 +28,7 @@ public final class OverlayRunPlanner {
         OverlayCache.preloadDetailRows(allDetailKeys);
         OverlayCache.preloadMainRows(mainTargets);
 
-        // 4) Warm shared caches (images/rarities once; prices per tier)
+        // Warm shared caches (images/rarities once; prices per tier)
         Set<Integer> allIds = OverlayCache.collectAllItemIdsFromPreloaded();
         OverlayCache.getOrFillImageCache(allIds);
         OverlayCache.getOrFillRarityCache(allIds);

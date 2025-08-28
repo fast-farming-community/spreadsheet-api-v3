@@ -10,15 +10,20 @@ import java.util.stream.Collectors;
 
 public class OverlayDBAccess {
 
-    public static String getMainRowsJson(String tableKey) {
+    public static String getMainRowsJson(String compositeKey /* "pageId|name" */) {
+        int bar = compositeKey.indexOf('|');
+        int pageId = Integer.parseInt(compositeKey.substring(0, bar));
+        String name = compositeKey.substring(bar + 1);
         return Jpa.tx(em -> {
             var query = em.createNativeQuery("""
                         SELECT rows
                           FROM public.tables
-                         WHERE name = :k
+                         WHERE page_id = :pid AND name = :k
                          ORDER BY id DESC
                          LIMIT 1
-                    """).setParameter("k", tableKey).getResultList();
+                    """).setParameter("pid", pageId)
+                    .setParameter("k", name)
+                    .getResultList();
             return query.isEmpty() ? null : (String) query.get(0);
         });
     }
@@ -33,13 +38,17 @@ public class OverlayDBAccess {
         });
     }
 
-    public static void updateMain(String tableKey, String rowsJson) {
+    public static void updateMain(String compositeKey, String rowsJson) {
+        int bar = compositeKey.indexOf('|');
+        int pageId = Integer.parseInt(compositeKey.substring(0, bar));
+        String name = compositeKey.substring(bar + 1);
         Jpa.txVoid(em -> em.createNativeQuery("""
                     UPDATE public.tables
                        SET rows = :rows, updated_at = now()
-                     WHERE name = :k
+                     WHERE page_id = :pid AND name = :k
                 """).setParameter("rows", rowsJson)
-                .setParameter("k", tableKey)
+                .setParameter("pid", pageId)
+                .setParameter("k", name)
                 .executeUpdate());
     }
 
@@ -55,7 +64,6 @@ public class OverlayDBAccess {
     }
 
     /** (fid, key) pairs for detail tables. */
-    @SuppressWarnings("unchecked")
     public static List<Object[]> listDetailTargets() {
         return Jpa.tx(em -> em.createNativeQuery("""
                     SELECT detail_feature_id, key
@@ -65,13 +73,15 @@ public class OverlayDBAccess {
     }
 
     /** Distinct main table names. */
-    @SuppressWarnings("unchecked")
     public static List<String> listMainTargets() {
-        return Jpa.tx(em -> (java.util.List<String>) em.createNativeQuery("""
-                    SELECT DISTINCT name
+        return Jpa.tx(em -> (java.util.List<Object[]>) em.createNativeQuery("""
+                    SELECT DISTINCT page_id, name
                       FROM public.tables
-                     ORDER BY name
-                """).getResultList());
+                     ORDER BY page_id, name
+                """).getResultList())
+                .stream()
+                .map(r -> ((Number) r[0]).intValue() + "|" + (String) r[1]) // "pageId|name"
+                .toList();
     }
 
     /** Latest rows JSON for each detail key in one (chunked) query. */
@@ -137,7 +147,6 @@ public class OverlayDBAccess {
                   FROM public.overlay_ignored_items
                  WHERE group_label IN (%s)
                 """.formatted(in);
-        @SuppressWarnings("unchecked")
         java.util.List<Number> rows = Jpa.tx(em -> em.createNativeQuery(sql).getResultList());
         java.util.Set<Integer> out = new java.util.HashSet<>(rows.size());
         for (Number n : rows)

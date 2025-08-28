@@ -1,15 +1,27 @@
 package eu.fast.gw2.dao;
 
+import java.io.IOException;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 
 import eu.fast.gw2.tools.Jpa;
 
 public class Gw2PricesDao {
 
-    @SuppressWarnings("unchecked")
+    // For JSON + HTTP (Java 11+ standard client, no extra deps)
+    private static final ObjectMapper M = new ObjectMapper();
+    private static final HttpClient HTTP = HttpClient.newHttpClient();
+
     public static Map<Integer, int[]> loadTier(List<Integer> ids, String tierKey) {
         if (ids == null || ids.isEmpty())
             return Collections.emptyMap();
@@ -196,4 +208,47 @@ public class Gw2PricesDao {
         });
     }
 
+    /**
+     * Return icon URLs for GW2 currencies (ids < 200) by calling the official API.
+     */
+    public static Map<Integer, String> loadCurrencyIconsByIds(Set<Integer> ids) {
+        if (ids == null || ids.isEmpty())
+            return Collections.emptyMap();
+
+        try {
+            // Build query string: e.g. ids=1,2,3
+            StringBuilder sb = new StringBuilder("https://api.guildwars2.com/v2/currencies?ids=");
+            boolean first = true;
+            for (Integer id : ids) {
+                if (!first)
+                    sb.append(',');
+                sb.append(id);
+                first = false;
+            }
+            URI uri = URI.create(sb.toString());
+
+            HttpRequest req = HttpRequest.newBuilder(uri).GET().build();
+            HttpResponse<String> resp = HTTP.send(req, HttpResponse.BodyHandlers.ofString());
+            if (resp.statusCode() != 200) {
+                System.err.println("GW2 API currencies failed: HTTP " + resp.statusCode());
+                return Collections.emptyMap();
+            }
+
+            JsonNode arr = M.readTree(resp.body());
+            Map<Integer, String> out = new HashMap<>();
+            if (arr != null && arr.isArray()) {
+                for (JsonNode n : arr) {
+                    JsonNode idN = n.get("id");
+                    JsonNode iconN = n.get("icon");
+                    if (idN != null && iconN != null && !iconN.isNull()) {
+                        out.put(idN.asInt(), iconN.asText());
+                    }
+                }
+            }
+            return out;
+        } catch (IOException | InterruptedException e) {
+            e.printStackTrace();
+            return Collections.emptyMap();
+        }
+    }
 }
