@@ -21,21 +21,22 @@ import com.fasterxml.jackson.databind.ObjectMapper;
  * Flow per run:
  * 1) Read JSON blobs from public.detail_tables.rows and public.tables.rows
  * (REPORTING ONLY).
- * 2) Parse JSON into distinct (Category, Key) pairs (Category and Key must be
- * non-blank).
+ * 2) Parse JSON into distinct (Category, Key) pairs (Category+Key non-blank),
+ * plus LEAF ("","") exception.
  * 3) Read (Category, Key) pairs from DB structure (SOURCE OF TRUTH for
  * seeding):
  * - INTERNAL: ("INTERNAL", CONCAT(features.name,'/',pages.name))
  * - DETAIL : (detail_features.name, detail_tables.key)
  * 4) Load existing public.calculations once (to know what’s missing).
- * 5) Plan & apply batched writes to public.calculations for ALL dbPairs:
+ * 5) Seed ALL DB pairs (regardless of JSON), and ensure LEAF exists:
  * - formulas_json default by mode: INTERNAL / COMPOSITE (only when NULL)
  * - operation default: INTERNAL => MAX, else SUM (only when NULL)
  * 6) Report DB vs JSON references (UNREFERENCED vs ORPHAN). No structure
  * writes.
  *
  * Notes:
- * - Category is assumed to NEVER be empty.
+ * - Category is assumed to NEVER be empty, except the LEAF case ("","") which
+ * is accepted from JSON only.
  * - JSON is used only for reporting; DB structure drives seeding.
  * - No pruning of calculations here.
  */
@@ -104,7 +105,8 @@ public class SeedCalculationsFromDetailTable {
         });
         Log.info("Loaded existing calculations: %d (%.3fs)", existingCalc.size(), secSince(t3));
 
-        // ---------- 5) Plan calc writes (batched) USING DB PAIRS ONLY ----------
+        // ---------- 5) Plan calc writes (batched) USING ALL DB PAIRS + ensure LEAF
+        // ----------
         Instant t4 = Instant.now();
 
         List<RowFormulas> needInsertF = new ArrayList<>();
@@ -112,8 +114,35 @@ public class SeedCalculationsFromDetailTable {
         List<RowOp> needInsertOp = new ArrayList<>();
         List<RowOp> needUpdateOp = new ArrayList<>();
 
-        for (Pair p : dbPairs) {
-            // mode: INTERNAL or COMPOSITE (Category is never empty)
+        // Seed the LEAF pair ("","") needed by overlays regardless of DB/JSON presence
+        final Pair LEAF = new Pair("", "");
+        final Existing exLeaf = existingCalc.get(LEAF.norm());
+        final String leafFjson = "{\"mode\":\"LEAF\"}";
+        final String leafOp = "SUM"; // default for non-INTERNAL
+        if (exLeaf == null) {
+            needInsertF.add(new RowFormulas("", "", leafOp, DEFAULT_TAXES, leafFjson,
+                    NOTES_PREFIX_DSL + " (mode=LEAF)"));
+            existingCalc.put(LEAF.norm(), new Existing(true, false));
+            needInsertOp.add(new RowOp("", "", leafOp, DEFAULT_TAXES,
+                    NOTES_PREFIX_OPS + " (op=" + leafOp + ")"));
+        } else {
+            if (!exLeaf.hasFormulas) {
+                needUpdateF.add(new RowFormulas("", "", null, null, leafFjson,
+                        NOTES_PREFIX_DSL + " (mode=LEAF)"));
+                exLeaf.hasFormulas = true;
+            }
+            if (!exLeaf.hasOperation) {
+                needUpdateOp.add(new RowOp("", "", leafOp, null,
+                        NOTES_PREFIX_OPS + " (op=" + leafOp + ")"));
+                exLeaf.hasOperation = true;
+            }
+        }
+
+        // Final seed set = ALL DB pairs (preserve original case)
+        List<Pair> pairsToSeed = new ArrayList<>(dbPairs);
+        Log.info("DB pairs to seed (all, regardless of JSON): %d", pairsToSeed.size());
+
+        for (Pair p : pairsToSeed) {
             final String mode = eqi(p.category(), "INTERNAL") ? "INTERNAL" : "COMPOSITE";
             final String fjson = "{\"mode\":\"" + mode + "\"}";
             final String defaultRowOp = eqi(p.category(), "INTERNAL") ? "MAX" : "SUM";
@@ -128,6 +157,7 @@ public class SeedCalculationsFromDetailTable {
                 needInsertOp.add(new RowOp(p.category(), p.key(), defaultRowOp, DEFAULT_TAXES,
                         NOTES_PREFIX_OPS + " (op=" + defaultRowOp + ")"));
             } else {
+                // Already present in calculations: fill missing fields only
                 if (!ex.hasFormulas) {
                     needUpdateF.add(new RowFormulas(p.category(), p.key(), null, null, fjson,
                             NOTES_PREFIX_DSL + " (mode=" + mode + ")"));
@@ -141,7 +171,7 @@ public class SeedCalculationsFromDetailTable {
             }
         }
 
-        Log.info("Plan calculations -> F:+%d ~%d, O:+%d ~%d (%.3fs)",
+        Log.info("Plan -> F:+%d ~%d, O:+%d ~%d (%.3fs)",
                 needInsertF.size(), needUpdateF.size(), needInsertOp.size(), needUpdateOp.size(), secSince(t4));
 
         // ---------- 6) Apply batched writes ----------
@@ -161,7 +191,7 @@ public class SeedCalculationsFromDetailTable {
         Log.section("SeedCalculations: complete (total %.3fs)", secSince(t0));
     }
 
-    // ---------- JSON discovery (reporting only; Category is never empty)
+    // ---------- JSON discovery (reporting only; accept LEAF as only exception)
     // ----------
     private static Set<Pair> discoverPairsFromJsonOnly(
             List<Object[]> detailTables, List<Object[]> mainTables) {
@@ -180,7 +210,7 @@ public class SeedCalculationsFromDetailTable {
                     // Normal case: require BOTH to be non-blank
                     jsonPairs.add(new Pair(cat.trim(), key.trim()));
                 }
-                // else: ignore partials (one blank, one non-blank)
+                // else: ignore partials
             }
         };
 
@@ -232,7 +262,7 @@ public class SeedCalculationsFromDetailTable {
                           JOIN public.features f ON f.id = p.feature_id
                     """).getResultList();
             return rows.stream()
-                    .map(o -> new Pair("INTERNAL", String.valueOf(o)).norm())
+                    .map(o -> new Pair("INTERNAL", String.valueOf(o)))
                     .collect(Collectors.toCollection(LinkedHashSet::new));
         });
 
@@ -245,7 +275,7 @@ public class SeedCalculationsFromDetailTable {
                           JOIN public.detail_features df ON df.id = dt.detail_feature_id
                     """).getResultList();
             return rows.stream()
-                    .map(r -> new Pair((String) r[0], (String) r[1]).norm())
+                    .map(r -> new Pair((String) r[0], (String) r[1]))
                     .collect(Collectors.toCollection(LinkedHashSet::new));
         });
 
@@ -512,15 +542,15 @@ public class SeedCalculationsFromDetailTable {
 
     private static class Log {
         static void section(String fmt, Object... args) {
-            System.out.println("\n=== " + String.format(fmt, args) + " ===");
+            System.out.println("\n=== " + String.format(Locale.ROOT, fmt, args) + " ===");
         }
 
         static void info(String fmt, Object... args) {
-            System.out.println("[INFO] " + String.format(fmt, args));
+            System.out.println("[INFO] " + String.format(Locale.ROOT, fmt, args));
         }
 
         static void warn(String fmt, Object... args) {
-            System.err.println("[WARN] " + String.format(fmt, args));
+            System.err.println("[WARN] " + String.format(Locale.ROOT, fmt, args));
         }
     }
 }
