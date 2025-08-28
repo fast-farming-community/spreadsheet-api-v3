@@ -410,6 +410,7 @@ public class RunDatabaseCompareDelta {
         String norm = normalizeHeaderName(field);
         boolean ignore = norm.startsWith("tpbuy")
                 || norm.startsWith("tpsell")
+                || norm.startsWith("paysoff")
                 || norm.startsWith("item")
                 || norm.startsWith("bestchoice");
         if (ignore)
