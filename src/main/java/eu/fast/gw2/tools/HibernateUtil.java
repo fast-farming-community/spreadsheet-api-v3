@@ -35,7 +35,6 @@ public final class HibernateUtil {
 
         Map<String, Object> hashMap = new HashMap<>();
         hashMap.put("hibernate.connection.datasource", ds); // programmatic DataSource
-        hashMap.put("hibernate.dialect", "org.hibernate.dialect.PostgreSQLDialect");
         hashMap.put("hibernate.hbm2ddl.auto", "validate");
         hashMap.put("hibernate.show_sql", "false");
         hashMap.put("hibernate.format_sql", "false");
