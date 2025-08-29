@@ -2,17 +2,35 @@ name: Deploy to fast_test
 
 on:
   push:
-    branches: [ main ]   # change if your default branch is different
+    branches: [ main ]
+
+concurrency:
+  group: deploy-fast_test
+  cancel-in-progress: true
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
+      - name: Add server to known_hosts
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -T 10 "${{ secrets.DEPLOY_HOST }}" >> ~/.ssh/known_hosts
+
       - name: Run deploy script on server
         uses: appleboy/ssh-action@v1.1.0
         with:
           host: ${{ secrets.DEPLOY_HOST }}
           username: ${{ secrets.DEPLOY_USER }}
           key: ${{ secrets.DEPLOY_KEY }}
+          script_stop: true
           script: |
-            /bin/bash -lc 'cd ~/spreadsheet-api-v3 && ./deploy-update.sh'
+            /bin/bash -lc '
+              if [ ! -d ~/spreadsheet-api-v3 ]; then
+                git clone https://github.com/fast-farming-community/spreadsheet-api-v3.git ~/spreadsheet-api-v3
+              fi
+              cd ~/spreadsheet-api-v3
+              git remote set-url origin https://github.com/fast-farming-community/spreadsheet-api-v3.git
+              chmod +x ./deploy-update.sh || true
+              ./deploy-update.sh
+            '
