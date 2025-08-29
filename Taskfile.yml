@@ -32,5 +32,5 @@ jobs:
               cd ~/spreadsheet-api-v3
               git remote set-url origin https://github.com/fast-farming-community/spreadsheet-api-v3.git
               chmod +x ./deploy-update.sh || true
-              ./deploy-update.sh
+              /home/cornix/opt/fast-api/deploy-update.sh
             '
