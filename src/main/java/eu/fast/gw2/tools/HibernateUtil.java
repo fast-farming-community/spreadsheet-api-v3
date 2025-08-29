@@ -12,36 +12,46 @@ import com.zaxxer.hikari.HikariDataSource;
 
 import jakarta.persistence.EntityManagerFactory;
 
+/**
+ * Programmatic Hibernate bootstrap:
+ * - Uses Hikari DataSource (no persistence.xml needed)
+ * - Reads DB creds from env: PG_URL / PG_USER / PG_PASS
+ * - Registers entity classes explicitly to avoid classpath scanning
+ */
 public final class HibernateUtil {
-    private static EntityManagerFactory emf;
+    private static volatile EntityManagerFactory EMF;
 
     private HibernateUtil() {
     }
 
     public static synchronized EntityManagerFactory emf() {
-        if (emf != null)
-            return emf;
+        if (EMF != null)
+            return EMF;
 
-        String url = System.getenv("PG_URL");
-        String user = System.getenv("PG_USER");
-        String pass = System.getenv("PG_PASS");
+        // Read credentials from environment
+        final String url = System.getenv("PG_URL");
+        final String user = System.getenv("PG_USER");
+        final String pass = System.getenv("PG_PASS");
         if (url == null || user == null || pass == null) {
             throw new IllegalStateException("Missing PG_URL/PG_USER/PG_PASS");
         }
 
         System.out.println(">> HibernateUtil: programmatic bootstrap (no persistence.xml)");
 
+        // Build Hikari DataSource
         DataSource ds = dataSource(url, user, pass);
 
-        Map<String, Object> hashMap = new HashMap<>();
-        hashMap.put("hibernate.connection.datasource", ds); // programmatic DataSource
-        hashMap.put("hibernate.hbm2ddl.auto", "validate");
-        hashMap.put("hibernate.show_sql", "false");
-        hashMap.put("hibernate.format_sql", "false");
-        hashMap.put("hibernate.jdbc.time_zone", "UTC");
-        hashMap.put("hibernate.archive.autodetection", "none");
-        // Register your @Entity classes explicitly:
-        hashMap.put(org.hibernate.cfg.AvailableSettings.LOADED_CLASSES, java.util.List.of(
+        // Properties override any persistence.xml PU named "gw2PU"
+        Map<String, Object> props = new HashMap<>();
+        props.put("hibernate.connection.datasource", ds);
+        props.put("hibernate.hbm2ddl.auto", "validate");
+        props.put("hibernate.show_sql", "false");
+        props.put("hibernate.format_sql", "false");
+        props.put("hibernate.jdbc.time_zone", "UTC");
+        props.put("hibernate.archive.autodetection", "none");
+
+        // Explicit entity registration
+        props.put(org.hibernate.cfg.AvailableSettings.LOADED_CLASSES, java.util.List.of(
                 eu.fast.gw2.model.About.class,
                 eu.fast.gw2.model.Contributor.class,
                 eu.fast.gw2.model.DetailFeature.class,
@@ -54,19 +64,17 @@ public final class HibernateUtil {
                 eu.fast.gw2.model.TableEntry.class,
                 eu.fast.gw2.model.User.class));
 
-        // IMPORTANT: this is the programmatic path; it does NOT look for
-        // persistence.xml
-        emf = new HibernatePersistenceProvider().createEntityManagerFactory("gw2PU", hashMap);
-
-        if (emf == null) {
+        // Create EMF overriding "gw2PU"
+        EMF = new HibernatePersistenceProvider().createEntityManagerFactory("gw2PU", props);
+        if (EMF == null) {
             throw new IllegalStateException("Hibernate EMF bootstrap failed (returned null).");
         }
         System.out.println(">> HibernateUtil: EMF initialized");
-        return emf;
+        return EMF;
     }
 
     private static DataSource dataSource(String url, String user, String pass) {
-        var cfg = new HikariConfig();
+        HikariConfig cfg = new HikariConfig();
         cfg.setJdbcUrl(url);
         cfg.setUsername(user);
         cfg.setPassword(pass);
