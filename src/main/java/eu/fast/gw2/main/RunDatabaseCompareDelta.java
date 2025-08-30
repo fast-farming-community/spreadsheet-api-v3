@@ -665,10 +665,7 @@ public class RunDatabaseCompareDelta {
         if (field == null)
             return false;
         String norm = normalizeHeaderName(field);
-        boolean ignore = norm.startsWith("tpbuy")
-                || norm.startsWith("tpsell")
-                || norm.startsWith("paysoff")
-                || norm.startsWith("item")
+        boolean ignore = norm.startsWith("paysoff")
                 || norm.startsWith("bestchoice");
         if (ignore)
             ignoredHeadersSeen.add(norm);
