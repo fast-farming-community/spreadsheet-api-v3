@@ -18,22 +18,36 @@ public class OverlayHelper {
     public static final String COL_KEY = "Key";
     public static final String COL_NAME = "Name";
     public static final String COL_AVG = "AverageAmount";
-    public static final String COL_TPB = "TPBuyProfit";
-    public static final String COL_TPS = "TPSellProfit";
     public static final String COL_TOTAL_AMOUNT = "TotalAmount";
     public static final String COL_BEST_BUY = "BestChoiceBuy";
     public static final String COL_BEST_SELL = "BestChoiceSell";
 
-    // Column names (tables - main)
-    public static final String COL_TPB_HR = "TPBuyProfitHr";
-    public static final String COL_TPS_HR = "TPSellProfitHr";
+    // ===== NEW 2×2 base columns =====
+    // Canonical "pair" to think about: ItemBuyProfitTPBuyProfit (buy-side) &
+    // ItemSellProfitTPSellProfit (sell-side)
+    public static final String COL_ITEM_SELL_TPBUY = "ItemSellProfitTPBuyProfit";
+    public static final String COL_ITEM_BUY_TPBUY = "ItemBuyProfitTPBuyProfit";
+    public static final String COL_ITEM_SELL_TPSELL = "ItemSellProfitTPSellProfit";
+    public static final String COL_ITEM_BUY_TPSELL = "ItemBuyProfitTPSellProfit";
+
+    // Column names (tables - main) — per-hour variants for all four
+    public static final String COL_ITEM_SELL_TPBUY_HR = "ItemSellProfitTPBuyProfitHr";
+    public static final String COL_ITEM_BUY_TPBUY_HR = "ItemBuyProfitTPBuyProfitHr";
+    public static final String COL_ITEM_SELL_TPSELL_HR = "ItemSellProfitTPSellProfitHr";
+    public static final String COL_ITEM_BUY_TPSELL_HR = "ItemBuyProfitTPSellProfitHr";
     public static final String COL_HOURS = "Duration";
 
-    // Column names (Spirit Shard augments)
-    public static final String COL_TPB_WSS = "TPBuyProfitwSS";
-    public static final String COL_TPS_WSS = "TPSellProfitwSS";
-    public static final String COL_TPB_WSS_HR = "TPBuyProfitwSSHr";
-    public static final String COL_TPS_WSS_HR = "TPSellProfitwSSHr";
+    // ===== NEW 2×2 Spirit Shard augments (Option B): four wSS columns (+Hr for
+    // main) =====
+    public static final String COL_ITEM_SELL_TPBUY_WSS = "ItemSellProfitTPBuyProfitwSS";
+    public static final String COL_ITEM_BUY_TPBUY_WSS = "ItemBuyProfitTPBuyProfitwSS";
+    public static final String COL_ITEM_SELL_TPSELL_WSS = "ItemSellProfitTPSellProfitwSS";
+    public static final String COL_ITEM_BUY_TPSELL_WSS = "ItemBuyProfitTPSellProfitwSS";
+
+    public static final String COL_ITEM_SELL_TPBUY_WSS_HR = "ItemSellProfitTPBuyProfitwSSHr";
+    public static final String COL_ITEM_BUY_TPBUY_WSS_HR = "ItemBuyProfitTPBuyProfitwSSHr";
+    public static final String COL_ITEM_SELL_TPSELL_WSS_HR = "ItemSellProfitTPSellProfitwSSHr";
+    public static final String COL_ITEM_BUY_TPSELL_WSS_HR = "ItemBuyProfitTPSellProfitwSSHr";
 
     public static String str(Object o) {
         return o == null ? null : String.valueOf(o);
@@ -107,6 +121,7 @@ public class OverlayHelper {
         return p;
     }
 
+    /** Historical "net": keep old behavior for bag EV (never negative). */
     public static int net(int value, int taxesPercent) {
         if (value <= 0)
             return 0;
@@ -116,6 +131,7 @@ public class OverlayHelper {
         return (int) Math.floor(value * f);
     }
 
+    /** Bag EV still uses non-negative semantics to match historical composites. */
     public static int[] bagEV(List<Map<String, Object>> drops, Map<Integer, int[]> priceMap, int taxesPercent) {
         long sumBuy = 0, sumSell = 0;
         for (var d : drops) {
@@ -133,86 +149,148 @@ public class OverlayHelper {
                 (int) Math.min(sumSell, Integer.MAX_VALUE) };
     }
 
-    public static void writeProfit(Map<String, Object> row, int buy, int sell) {
-        row.put(COL_TPB, buy);
-        row.put(COL_TPS, sell);
+    // ===== Writers for new 2×2 results =====
+
+    public static void writeFour(Map<String, Object> row,
+            int itemBuy_tpBuy,
+            int itemSell_tpBuy,
+            int itemBuy_tpSell,
+            int itemSell_tpSell) {
+        row.put(COL_ITEM_BUY_TPBUY, itemBuy_tpBuy);
+        row.put(COL_ITEM_SELL_TPBUY, itemSell_tpBuy);
+        row.put(COL_ITEM_BUY_TPSELL, itemBuy_tpSell);
+        row.put(COL_ITEM_SELL_TPSELL, itemSell_tpSell);
     }
 
-    public static void writeProfitWithHour(Map<String, Object> row, int buy, int sell) {
-        writeProfit(row, buy, sell);
+    public static void writeFourWithHour(Map<String, Object> row,
+            int itemBuy_tpBuy,
+            int itemSell_tpBuy,
+            int itemBuy_tpSell,
+            int itemSell_tpSell) {
+        writeFour(row, itemBuy_tpBuy, itemSell_tpBuy, itemBuy_tpSell, itemSell_tpSell);
         double hours = toDouble(row.get(COL_HOURS), 0.0);
-        int buyHr = (hours > 0.0) ? (int) Math.floor(buy / hours) : buy;
-        int sellHr = (hours > 0.0) ? (int) Math.floor(sell / hours) : sell;
-        row.put(COL_TPB_HR, buyHr);
-        row.put(COL_TPS_HR, sellHr);
+
+        int v;
+
+        v = (hours > 0.0) ? (int) Math.floor(itemSell_tpBuy / hours) : itemSell_tpBuy;
+        row.put(COL_ITEM_SELL_TPBUY_HR, v);
+
+        v = (hours > 0.0) ? (int) Math.floor(itemBuy_tpBuy / hours) : itemBuy_tpBuy;
+        row.put(COL_ITEM_BUY_TPBUY_HR, v);
+
+        v = (hours > 0.0) ? (int) Math.floor(itemSell_tpSell / hours) : itemSell_tpSell;
+        row.put(COL_ITEM_SELL_TPSELL_HR, v);
+
+        v = (hours > 0.0) ? (int) Math.floor(itemBuy_tpSell / hours) : itemBuy_tpSell;
+        row.put(COL_ITEM_BUY_TPSELL_HR, v);
     }
+
+    // ===== Aggregation across rows (TOTAL, BestChoice) =====
 
     public static void applyAggregation(List<Map<String, Object>> rows, String op) {
-        var buyBase = new ArrayList<Integer>();
-        var sellBase = new ArrayList<Integer>();
-        var buyHr = new ArrayList<Integer>();
-        var sellHr = new ArrayList<Integer>();
+        // collectors for base
+        var c_IS_TPB = new ArrayList<Integer>();
+        var c_IB_TPB = new ArrayList<Integer>();
+        var c_IS_TPS = new ArrayList<Integer>();
+        var c_IB_TPS = new ArrayList<Integer>();
+
+        // collectors for per-hour (may be absent; compute if hours>0 and base present)
+        var c_IS_TPB_HR = new ArrayList<Integer>();
+        var c_IB_TPB_HR = new ArrayList<Integer>();
+        var c_IS_TPS_HR = new ArrayList<Integer>();
+        var c_IB_TPS_HR = new ArrayList<Integer>();
 
         // wSS collectors
-        var buyWSS = new ArrayList<Integer>();
-        var sellWSS = new ArrayList<Integer>();
-        var buyWSSHr = new ArrayList<Integer>();
-        var sellWSSHr = new ArrayList<Integer>();
+        var c_IS_TPB_WSS = new ArrayList<Integer>();
+        var c_IB_TPB_WSS = new ArrayList<Integer>();
+        var c_IS_TPS_WSS = new ArrayList<Integer>();
+        var c_IB_TPS_WSS = new ArrayList<Integer>();
 
-        for (var query : rows) {
-            Integer b = toIntBoxed(query.get(COL_TPB));
-            Integer s = toIntBoxed(query.get(COL_TPS));
-            if (b != null)
-                buyBase.add(b);
-            if (s != null)
-                sellBase.add(s);
+        var c_IS_TPB_WSS_HR = new ArrayList<Integer>();
+        var c_IB_TPB_WSS_HR = new ArrayList<Integer>();
+        var c_IS_TPS_WSS_HR = new ArrayList<Integer>();
+        var c_IB_TPS_WSS_HR = new ArrayList<Integer>();
 
-            Integer bh = query.containsKey(COL_TPB_HR) ? toIntBoxed(query.get(COL_TPB_HR)) : null;
-            Integer sh = query.containsKey(COL_TPS_HR) ? toIntBoxed(query.get(COL_TPS_HR)) : null;
+        for (var r : rows) {
+            // base
+            Integer sTPB = toIntBoxed(r.get(COL_ITEM_SELL_TPBUY));
+            Integer bTPB = toIntBoxed(r.get(COL_ITEM_BUY_TPBUY));
+            Integer sTPS = toIntBoxed(r.get(COL_ITEM_SELL_TPSELL));
+            Integer bTPS = toIntBoxed(r.get(COL_ITEM_BUY_TPSELL));
+            if (sTPB != null)
+                c_IS_TPB.add(sTPB);
+            if (bTPB != null)
+                c_IB_TPB.add(bTPB);
+            if (sTPS != null)
+                c_IS_TPS.add(sTPS);
+            if (bTPS != null)
+                c_IB_TPS.add(bTPS);
 
-            if (bh == null || sh == null) {
-                double hours = toDouble(query.get(COL_HOURS), 0.0);
+            // hours (use provided, or compute if hours>0)
+            Integer sTPB_hr = toIntBoxed(r.get(COL_ITEM_SELL_TPBUY_HR));
+            Integer bTPB_hr = toIntBoxed(r.get(COL_ITEM_BUY_TPBUY_HR));
+            Integer sTPS_hr = toIntBoxed(r.get(COL_ITEM_SELL_TPSELL_HR));
+            Integer bTPS_hr = toIntBoxed(r.get(COL_ITEM_BUY_TPSELL_HR));
+
+            if (sTPB_hr == null || bTPB_hr == null || sTPS_hr == null || bTPS_hr == null) {
+                double hours = toDouble(r.get(COL_HOURS), 0.0);
                 if (hours > 0.0) {
-                    if (bh == null && b != null)
-                        bh = (int) Math.floor(b / hours);
-                    if (sh == null && s != null)
-                        sh = (int) Math.floor(s / hours);
+                    if (sTPB_hr == null && sTPB != null)
+                        sTPB_hr = (int) Math.floor(sTPB / hours);
+                    if (bTPB_hr == null && bTPB != null)
+                        bTPB_hr = (int) Math.floor(bTPB / hours);
+                    if (sTPS_hr == null && sTPS != null)
+                        sTPS_hr = (int) Math.floor(sTPS / hours);
+                    if (bTPS_hr == null && bTPS != null)
+                        bTPS_hr = (int) Math.floor(bTPS / hours);
                 }
             }
-            if (bh != null)
-                buyHr.add(bh);
-            if (sh != null)
-                sellHr.add(sh);
+            if (sTPB_hr != null)
+                c_IS_TPB_HR.add(sTPB_hr);
+            if (bTPB_hr != null)
+                c_IB_TPB_HR.add(bTPB_hr);
+            if (sTPS_hr != null)
+                c_IS_TPS_HR.add(sTPS_hr);
+            if (bTPS_hr != null)
+                c_IB_TPS_HR.add(bTPS_hr);
 
-            // -------- collect wSS --------
-            Integer bwss = toIntBoxed(query.get(COL_TPB_WSS));
-            Integer swss = toIntBoxed(query.get(COL_TPS_WSS));
-            if (bwss != null)
-                buyWSS.add(bwss);
-            if (swss != null)
-                sellWSS.add(swss);
+            // wSS base
+            Integer sTPB_wss = toIntBoxed(r.get(COL_ITEM_SELL_TPBUY_WSS));
+            Integer bTPB_wss = toIntBoxed(r.get(COL_ITEM_BUY_TPBUY_WSS));
+            Integer sTPS_wss = toIntBoxed(r.get(COL_ITEM_SELL_TPSELL_WSS));
+            Integer bTPS_wss = toIntBoxed(r.get(COL_ITEM_BUY_TPSELL_WSS));
+            if (sTPB_wss != null)
+                c_IS_TPB_WSS.add(sTPB_wss);
+            if (bTPB_wss != null)
+                c_IB_TPB_WSS.add(bTPB_wss);
+            if (sTPS_wss != null)
+                c_IS_TPS_WSS.add(sTPS_wss);
+            if (bTPS_wss != null)
+                c_IB_TPS_WSS.add(bTPS_wss);
 
-            Integer bwssHr = query.containsKey(COL_TPB_WSS_HR) ? toIntBoxed(query.get(COL_TPB_WSS_HR)) : null;
-            Integer swssHr = query.containsKey(COL_TPS_WSS_HR) ? toIntBoxed(query.get(COL_TPS_WSS_HR)) : null;
+            // wSS hr
+            Integer sTPB_wss_hr = toIntBoxed(r.get(COL_ITEM_SELL_TPBUY_WSS_HR));
+            Integer bTPB_wss_hr = toIntBoxed(r.get(COL_ITEM_BUY_TPBUY_WSS_HR));
+            Integer sTPS_wss_hr = toIntBoxed(r.get(COL_ITEM_SELL_TPSELL_WSS_HR));
+            Integer bTPS_wss_hr = toIntBoxed(r.get(COL_ITEM_BUY_TPSELL_WSS_HR));
 
-            if (bwssHr == null || swssHr == null) {
-                double hours = toDouble(query.get(COL_HOURS), 0.0);
-                if (hours > 0.0) {
-                    if (bwssHr == null && bwss != null)
-                        bwssHr = (int) Math.floor(bwss / hours);
-                    if (swssHr == null && swss != null)
-                        swssHr = (int) Math.floor(swss / hours);
-                }
-            }
-            if (bwssHr != null)
-                buyWSSHr.add(bwssHr);
-            if (swssHr != null)
-                sellWSSHr.add(swssHr);
+            if (sTPB_wss_hr != null)
+                c_IS_TPB_WSS_HR.add(sTPB_wss_hr);
+            if (bTPB_wss_hr != null)
+                c_IB_TPB_WSS_HR.add(bTPB_wss_hr);
+            if (sTPS_wss_hr != null)
+                c_IS_TPS_WSS_HR.add(sTPS_wss_hr);
+            if (bTPS_wss_hr != null)
+                c_IB_TPS_WSS_HR.add(bTPS_wss_hr);
         }
 
-        if (buyBase.isEmpty() && sellBase.isEmpty() && buyHr.isEmpty() && sellHr.isEmpty()
-                && buyWSS.isEmpty() && sellWSS.isEmpty() && buyWSSHr.isEmpty() && sellWSSHr.isEmpty())
+        if (c_IS_TPB.isEmpty() && c_IB_TPB.isEmpty() && c_IS_TPS.isEmpty() && c_IB_TPS.isEmpty()
+                && c_IS_TPB_HR.isEmpty() && c_IB_TPB_HR.isEmpty() && c_IS_TPS_HR.isEmpty() && c_IB_TPS_HR.isEmpty()
+                && c_IS_TPB_WSS.isEmpty() && c_IB_TPB_WSS.isEmpty() && c_IS_TPS_WSS.isEmpty() && c_IB_TPS_WSS.isEmpty()
+                && c_IS_TPB_WSS_HR.isEmpty() && c_IB_TPB_WSS_HR.isEmpty() && c_IS_TPS_WSS_HR.isEmpty()
+                && c_IB_TPS_WSS_HR.isEmpty()) {
             return;
+        }
 
         String agg = (op == null ? "SUM" : op.toUpperCase(java.util.Locale.ROOT));
         java.util.function.Function<List<Integer>, Integer> AGG = xs -> {
@@ -226,16 +304,26 @@ public class OverlayHelper {
             };
         };
 
-        int aggBuyBase = AGG.apply(buyBase);
-        int aggSellBase = AGG.apply(sellBase);
-        Integer aggBuyHr = buyHr.isEmpty() ? null : AGG.apply(buyHr);
-        Integer aggSellHr = sellHr.isEmpty() ? null : AGG.apply(sellHr);
+        // compute all aggregates
+        Integer t_IS_TPB = c_IS_TPB.isEmpty() ? null : AGG.apply(c_IS_TPB);
+        Integer t_IB_TPB = c_IB_TPB.isEmpty() ? null : AGG.apply(c_IB_TPB);
+        Integer t_IS_TPS = c_IS_TPS.isEmpty() ? null : AGG.apply(c_IS_TPS);
+        Integer t_IB_TPS = c_IB_TPS.isEmpty() ? null : AGG.apply(c_IB_TPS);
 
-        // wSS aggregates
-        Integer aggBuyWSS = buyWSS.isEmpty() ? null : AGG.apply(buyWSS);
-        Integer aggSellWSS = sellWSS.isEmpty() ? null : AGG.apply(sellWSS);
-        Integer aggBuyWSSHr = buyWSSHr.isEmpty() ? null : AGG.apply(buyWSSHr);
-        Integer aggSellWSSHr = sellWSSHr.isEmpty() ? null : AGG.apply(sellWSSHr);
+        Integer t_IS_TPB_HR = c_IS_TPB_HR.isEmpty() ? null : AGG.apply(c_IS_TPB_HR);
+        Integer t_IB_TPB_HR = c_IB_TPB_HR.isEmpty() ? null : AGG.apply(c_IB_TPB_HR);
+        Integer t_IS_TPS_HR = c_IS_TPS_HR.isEmpty() ? null : AGG.apply(c_IS_TPS_HR);
+        Integer t_IB_TPS_HR = c_IB_TPS_HR.isEmpty() ? null : AGG.apply(c_IB_TPS_HR);
+
+        Integer t_IS_TPB_WSS = c_IS_TPB_WSS.isEmpty() ? null : AGG.apply(c_IS_TPB_WSS);
+        Integer t_IB_TPB_WSS = c_IB_TPB_WSS.isEmpty() ? null : AGG.apply(c_IB_TPB_WSS);
+        Integer t_IS_TPS_WSS = c_IS_TPS_WSS.isEmpty() ? null : AGG.apply(c_IS_TPS_WSS);
+        Integer t_IB_TPS_WSS = c_IB_TPS_WSS.isEmpty() ? null : AGG.apply(c_IB_TPS_WSS);
+
+        Integer t_IS_TPB_WSS_HR = c_IS_TPB_WSS_HR.isEmpty() ? null : AGG.apply(c_IS_TPB_WSS_HR);
+        Integer t_IB_TPB_WSS_HR = c_IB_TPB_WSS_HR.isEmpty() ? null : AGG.apply(c_IB_TPB_WSS_HR);
+        Integer t_IS_TPS_WSS_HR = c_IS_TPS_WSS_HR.isEmpty() ? null : AGG.apply(c_IS_TPS_WSS_HR);
+        Integer t_IB_TPS_WSS_HR = c_IB_TPS_WSS_HR.isEmpty() ? null : AGG.apply(c_IB_TPS_WSS_HR);
 
         Map<String, Object> total = rows.stream()
                 .filter(q -> "TOTAL".equalsIgnoreCase(str(q.get(COL_KEY)))
@@ -249,25 +337,46 @@ public class OverlayHelper {
                     return t;
                 });
 
-        total.put(COL_TPB, aggBuyBase);
-        total.put(COL_TPS, aggSellBase);
-        if (aggBuyHr != null)
-            total.put(COL_TPB_HR, aggBuyHr);
-        if (aggSellHr != null)
-            total.put(COL_TPS_HR, aggSellHr);
+        if (t_IS_TPB != null)
+            total.put(COL_ITEM_SELL_TPBUY, t_IS_TPB);
+        if (t_IB_TPB != null)
+            total.put(COL_ITEM_BUY_TPBUY, t_IB_TPB);
+        if (t_IS_TPS != null)
+            total.put(COL_ITEM_SELL_TPSELL, t_IS_TPS);
+        if (t_IB_TPS != null)
+            total.put(COL_ITEM_BUY_TPSELL, t_IB_TPS);
 
-        // write wSS totals
-        if (aggBuyWSS != null)
-            total.put(COL_TPB_WSS, aggBuyWSS);
-        if (aggSellWSS != null)
-            total.put(COL_TPS_WSS, aggSellWSS);
-        if (aggBuyWSSHr != null)
-            total.put(COL_TPB_WSS_HR, aggBuyWSSHr);
-        if (aggSellWSSHr != null)
-            total.put(COL_TPS_WSS_HR, aggSellWSSHr);
+        if (t_IS_TPB_HR != null)
+            total.put(COL_ITEM_SELL_TPBUY_HR, t_IS_TPB_HR);
+        if (t_IB_TPB_HR != null)
+            total.put(COL_ITEM_BUY_TPBUY_HR, t_IB_TPB_HR);
+        if (t_IS_TPS_HR != null)
+            total.put(COL_ITEM_SELL_TPSELL_HR, t_IS_TPS_HR);
+        if (t_IB_TPS_HR != null)
+            total.put(COL_ITEM_BUY_TPSELL_HR, t_IB_TPS_HR);
+
+        if (t_IS_TPB_WSS != null)
+            total.put(COL_ITEM_SELL_TPBUY_WSS, t_IS_TPB_WSS);
+        if (t_IB_TPB_WSS != null)
+            total.put(COL_ITEM_BUY_TPBUY_WSS, t_IB_TPB_WSS);
+        if (t_IS_TPS_WSS != null)
+            total.put(COL_ITEM_SELL_TPSELL_WSS, t_IS_TPS_WSS);
+        if (t_IB_TPS_WSS != null)
+            total.put(COL_ITEM_BUY_TPSELL_WSS, t_IB_TPS_WSS);
+
+        if (t_IS_TPB_WSS_HR != null)
+            total.put(COL_ITEM_SELL_TPBUY_WSS_HR, t_IS_TPB_WSS_HR);
+        if (t_IB_TPB_WSS_HR != null)
+            total.put(COL_ITEM_BUY_TPBUY_WSS_HR, t_IB_TPB_WSS_HR);
+        if (t_IS_TPS_WSS_HR != null)
+            total.put(COL_ITEM_SELL_TPSELL_WSS_HR, t_IS_TPS_WSS_HR);
+        if (t_IB_TPS_WSS_HR != null)
+            total.put(COL_ITEM_BUY_TPSELL_WSS_HR, t_IB_TPS_WSS_HR);
 
         // ---------- BestChoice ----------
-        if ("MAX".equals(agg)) {
+        // Preserve semantic: choose best "buy" from ItemBuy_TPBuy, and best "sell" from
+        // ItemSell_TPSell
+        if ("MAX".equalsIgnoreCase(agg)) {
             String bestBuyName = null;
             String bestSellName = null;
             int bestBuyVal = Integer.MIN_VALUE;
@@ -278,15 +387,15 @@ public class OverlayHelper {
                 if ("TOTAL".equalsIgnoreCase(rName))
                     continue;
 
-                Integer b = toIntBoxed(r.get(COL_TPB));
-                if (b != null && b > bestBuyVal) {
-                    bestBuyVal = b;
+                Integer buyV = toIntBoxed(r.get(COL_ITEM_BUY_TPBUY));
+                Integer sellV = toIntBoxed(r.get(COL_ITEM_SELL_TPSELL));
+
+                if (buyV != null && buyV > bestBuyVal) {
+                    bestBuyVal = buyV;
                     bestBuyName = (rName != null && !rName.isBlank()) ? rName : str(r.get(COL_KEY));
                 }
-
-                Integer s = toIntBoxed(r.get(COL_TPS));
-                if (s != null && s > bestSellVal) {
-                    bestSellVal = s;
+                if (sellV != null && sellV > bestSellVal) {
+                    bestSellVal = sellV;
                     bestSellName = (rName != null && !rName.isBlank()) ? rName : str(r.get(COL_KEY));
                 }
             }

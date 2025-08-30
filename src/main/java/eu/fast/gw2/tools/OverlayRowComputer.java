@@ -42,11 +42,13 @@ public final class OverlayRowComputer {
 
     static void computeRow(Map<String, Object> row, ComputeContext ctx, int rowIndex,
             OverlayProfiler prof, OverlayProblemLog problems) {
+
         String category = OverlayHelper.str(row.get(OverlayHelper.COL_CAT));
         String compositeKey = OverlayHelper.str(row.get(OverlayHelper.COL_KEY));
         int taxesPct = OverlayCalc.pickTaxesPercent(category, compositeKey, ctx.tableConfig);
         int itemId = OverlayHelper.toInt(row.get(OverlayHelper.COL_ID), -1);
 
+        // enrich image/rarity if we can (safe; does not touch profit numbers)
         if (itemId > 0) {
             String imageUrl = ctx.imageUrlByItemId.get(itemId);
             if (imageUrl != null && !imageUrl.isBlank())
@@ -56,64 +58,95 @@ public final class OverlayRowComputer {
                 row.put(OverlayHelper.COL_RARITY, rarity);
         }
 
-        if (itemId == 1) {
-            int amt = (int) Math.floor(OverlayHelper.toDouble(row.get(OverlayHelper.COL_AVG), 0.0));
-            if (ctx.isMain)
-                OverlayHelper.writeProfitWithHour(row, amt, amt);
-            else
-                OverlayHelper.writeProfit(row, amt, amt);
-
-            writeSpiritShardAugments(row, ctx);
-
+        // ===== NEW: UNTOUCHED hard stop =====
+        // If Category is exactly "UNTOUCHED" (case-sensitive), DO NOT overwrite any
+        // profit columns (base, hr, wSS).
+        if ("UNTOUCHED".equals(category)) {
+            if (prof != null)
+                prof.fastItem++; // count as a quick path; nothing written
             return;
         }
 
-        // FAST PATH #1: Composite reference
+        // Special currency: Coin (id==1) — write same value to all four
+        if (itemId == 1) {
+            int amt = (int) Math.floor(OverlayHelper.toDouble(row.get(OverlayHelper.COL_AVG), 0.0));
+            if (ctx.isMain) {
+                OverlayHelper.writeFourWithHour(row, amt, amt, amt, amt);
+            } else {
+                OverlayHelper.writeFour(row, amt, amt, amt, amt);
+            }
+            writeSpiritShardAugments(row, ctx);
+            return;
+        }
+
+        // ========== NEGATIVE category (exact, case-sensitive) ==========
+        // AvgAmount * ( - unit_price buy/sell ) ; NEVER apply tax
+        if ("NEGATIVE".equals(category)) {
+            double qty = OverlayHelper.toDouble(row.get(OverlayHelper.COL_AVG), 1.0);
+
+            int[] ps = (itemId > 0) ? ctx.priceByItemId.get(itemId) : null;
+            int unitBuy = (ps == null || ps.length < 1) ? 0 : ps[0];
+            int unitSell = (ps == null || ps.length < 2) ? 0 : ps[1];
+
+            int itemBuy = (int) Math.round(qty * (-unitBuy));
+            int itemSell = (int) Math.round(qty * (-unitSell));
+
+            int IB_TPB = itemBuy;
+            int IS_TPB = itemSell;
+            int IB_TPS = itemBuy;
+            int IS_TPS = itemSell;
+
+            if (ctx.isMain)
+                OverlayHelper.writeFourWithHour(row, IB_TPB, IS_TPB, IB_TPS, IS_TPS);
+            else
+                OverlayHelper.writeFour(row, IB_TPB, IS_TPB, IB_TPS, IS_TPS);
+
+            writeSpiritShardAugments(row, ctx);
+            if (prof != null)
+                prof.fastItem++;
+            return;
+        }
+
+        // ========== FAST PATH #1: Composite reference ==========
         if (OverlayHelper.isCompositeRef(category, compositeKey)) {
             int[] ev = OverlayCalc.evForDetail(compositeKey, ctx.priceByItemId, taxesPct, ctx.tier.columnKey());
-            int buy = (ev != null && ev.length > 0) ? Math.max(0, ev[0]) : 0;
-            int sell = (ev != null && ev.length > 1) ? Math.max(0, ev[1]) : 0;
+            int evBuy = (ev != null && ev.length > 0) ? ev[0] : 0; // bagEV non-negative
+            int evSell = (ev != null && ev.length > 1) ? ev[1] : 0;
+
+            int IB_TPB = evBuy;
+            int IS_TPB = evBuy;
+            int IB_TPS = evSell;
+            int IS_TPS = evSell;
 
             if (!ctx.isMain) {
                 double qty = OverlayHelper.toDouble(row.get(OverlayHelper.COL_AVG), 1.0);
-                buy = (int) Math.round(buy * qty);
-                sell = (int) Math.round(sell * qty);
-            }
-
-            if (buy < 1 && sell < 1) {
-                if (ctx.isMain)
-                    OverlayHelper.writeProfitWithHour(row, 0, 0);
-                else
-                    OverlayHelper.writeProfit(row, 0, 0);
-
-                writeSpiritShardAugments(row, ctx);
-
-                if (prof != null)
-                    prof.belowCutoff++;
-                return;
+                IB_TPB = (int) Math.round(IB_TPB * qty);
+                IS_TPB = (int) Math.round(IS_TPB * qty);
+                IB_TPS = (int) Math.round(IB_TPS * qty);
+                IS_TPS = (int) Math.round(IS_TPS * qty);
             }
 
             if (ctx.isMain)
-                OverlayHelper.writeProfitWithHour(row, buy, sell);
+                OverlayHelper.writeFourWithHour(row, IB_TPB, IS_TPB, IB_TPS, IS_TPS);
             else
-                OverlayHelper.writeProfit(row, buy, sell);
+                OverlayHelper.writeFour(row, IB_TPB, IS_TPB, IB_TPS, IS_TPS);
 
             writeSpiritShardAugments(row, ctx);
-
             if (prof != null)
                 prof.fastComposite++;
             return;
         }
 
-        // FAST PATH #2: Plain item
+        // ========== FAST PATH #2: Plain item ==========
         boolean looksPlainItem = !OverlayHelper.isInternal(category)
                 && (compositeKey == null || compositeKey.isBlank())
                 && itemId > 0;
 
         if (looksPlainItem) {
             int[] ps = ctx.priceByItemId.get(itemId);
-            int tpb = (ps == null || ps.length < 1) ? 0 : Math.max(0, ps[0]);
-            int tps = (ps == null || ps.length < 2) ? 0 : Math.max(0, ps[1]);
+            int tpb = (ps == null || ps.length < 1) ? 0 : ps[0];
+            int tps = (ps == null || ps.length < 2) ? 0 : ps[1];
+
             int sellNet = netSellAfterTax(tps, taxesPct);
 
             if (tpb == 0 && sellNet == 0) {
@@ -122,40 +155,43 @@ public final class OverlayRowComputer {
                     sellNet = vv;
             }
 
-            int buy = tpb, sell = sellNet;
+            int IB_TPB = tpb;
+            int IS_TPB = tpb;
+            int IB_TPS = sellNet;
+            int IS_TPS = sellNet;
 
             if (!ctx.isMain) {
                 double qty = OverlayHelper.toDouble(row.get(OverlayHelper.COL_AVG), 1.0);
-                buy = (int) Math.round(buy * qty);
-                sell = (int) Math.round(sell * qty);
+                IB_TPB = (int) Math.round(IB_TPB * qty);
+                IS_TPB = (int) Math.round(IS_TPB * qty);
+                IB_TPS = (int) Math.round(IB_TPS * qty);
+                IS_TPS = (int) Math.round(IS_TPS * qty);
             }
 
-            if (buy < 1 && sell < 1) {
+            if (Math.abs(IB_TPB) < MIN_COPPER && Math.abs(IS_TPS) < MIN_COPPER
+                    && Math.abs(IS_TPB) < MIN_COPPER && Math.abs(IB_TPS) < MIN_COPPER) {
                 if (ctx.isMain)
-                    OverlayHelper.writeProfitWithHour(row, 0, 0);
+                    OverlayHelper.writeFourWithHour(row, 0, 0, 0, 0);
                 else
-                    OverlayHelper.writeProfit(row, 0, 0);
-
+                    OverlayHelper.writeFour(row, 0, 0, 0, 0);
                 writeSpiritShardAugments(row, ctx);
-
                 if (prof != null)
                     prof.belowCutoff++;
                 return;
             }
 
             if (ctx.isMain)
-                OverlayHelper.writeProfitWithHour(row, buy, sell);
+                OverlayHelper.writeFourWithHour(row, IB_TPB, IS_TPB, IB_TPS, IS_TPS);
             else
-                OverlayHelper.writeProfit(row, buy, sell);
+                OverlayHelper.writeFour(row, IB_TPB, IS_TPB, IB_TPS, IS_TPS);
 
             writeSpiritShardAugments(row, ctx);
-
             if (prof != null)
                 prof.fastItem++;
             return;
         }
 
-        // DSL fallback (STRICT)
+        // ========== DSL fallback (STRICT) ==========
         var eval = OverlayDslEngine.evaluateRowStrict(category, compositeKey, row, ctx.tier, taxesPct,
                 ctx.priceByItemId);
 
@@ -169,9 +205,9 @@ public final class OverlayRowComputer {
                     String.valueOf(category), String.valueOf(compositeKey), ctx.tableKey,
                     rowIndex, String.valueOf(row.get(OverlayHelper.COL_NAME)));
             if (ctx.isMain)
-                OverlayHelper.writeProfitWithHour(row, 0, 0);
+                OverlayHelper.writeFourWithHour(row, 0, 0, 0, 0);
             else
-                OverlayHelper.writeProfit(row, 0, 0);
+                OverlayHelper.writeFour(row, 0, 0, 0, 0);
 
             writeSpiritShardAugments(row, ctx);
 
@@ -181,41 +217,43 @@ public final class OverlayRowComputer {
             return;
         }
 
-        if (ctx.isMain) {
-            double buyRaw = eval.buy();
-            double sellRaw = eval.sell();
-            if (buyRaw < MIN_COPPER && sellRaw < MIN_COPPER) {
-                OverlayHelper.writeProfitWithHour(row, 0, 0);
-                writeSpiritShardAugments(row, ctx);
-                if (prof != null)
-                    prof.belowCutoff++;
-                return;
-            }
-            OverlayHelper.writeProfitWithHour(row, eval.buy(), eval.sell());
-            writeSpiritShardAugments(row, ctx);
-            if (problems != null)
-                problems.recordIfZero(true, ctx.tableKey, ctx.detailFeatureIdOrNull, rowIndex, row, taxesPct,
-                        "computed_zero");
-        } else {
-            double qty = OverlayHelper.toDouble(row.get(OverlayHelper.COL_AVG), 1.0);
-            double buyRaw = eval.buy() * qty;
-            double sellRaw = eval.sell() * qty;
-            if (buyRaw < MIN_COPPER && sellRaw < MIN_COPPER) {
-                OverlayHelper.writeProfit(row, 0, 0);
-                writeSpiritShardAugments(row, ctx);
+        int baseBuy = eval.buy();
+        int baseSell = eval.sell();
 
-                if (prof != null)
-                    prof.belowCutoff++;
-                return;
-            }
-            int buyTotal = (int) Math.round(buyRaw);
-            int sellTotal = (int) Math.round(sellRaw);
-            OverlayHelper.writeProfit(row, buyTotal, sellTotal);
-            writeSpiritShardAugments(row, ctx);
-            if (problems != null)
-                problems.recordIfZero(false, ctx.tableKey, ctx.detailFeatureIdOrNull, rowIndex, row, taxesPct,
-                        "computed_zero");
+        int IB_TPB = baseBuy;
+        int IS_TPB = baseBuy;
+        int IB_TPS = baseSell;
+        int IS_TPS = baseSell;
+
+        if (!ctx.isMain) {
+            double qty = OverlayHelper.toDouble(row.get(OverlayHelper.COL_AVG), 1.0);
+            IB_TPB = (int) Math.round(IB_TPB * qty);
+            IS_TPB = (int) Math.round(IS_TPB * qty);
+            IB_TPS = (int) Math.round(IB_TPS * qty);
+            IS_TPS = (int) Math.round(IS_TPS * qty);
         }
+
+        if (Math.abs(IB_TPB) < MIN_COPPER && Math.abs(IS_TPB) < MIN_COPPER
+                && Math.abs(IB_TPS) < MIN_COPPER && Math.abs(IS_TPS) < MIN_COPPER) {
+            if (ctx.isMain)
+                OverlayHelper.writeFourWithHour(row, 0, 0, 0, 0);
+            else
+                OverlayHelper.writeFour(row, 0, 0, 0, 0);
+            writeSpiritShardAugments(row, ctx);
+            if (prof != null)
+                prof.belowCutoff++;
+            return;
+        }
+
+        if (ctx.isMain)
+            OverlayHelper.writeFourWithHour(row, IB_TPB, IS_TPB, IB_TPS, IS_TPS);
+        else
+            OverlayHelper.writeFour(row, IB_TPB, IS_TPB, IB_TPS, IS_TPS);
+
+        writeSpiritShardAugments(row, ctx);
+        if (problems != null)
+            problems.recordIfZero(ctx.isMain, ctx.tableKey, ctx.detailFeatureIdOrNull, rowIndex, row, taxesPct,
+                    "computed_zero");
     }
 
     // -------- helpers used by runners --------
@@ -230,57 +268,65 @@ public final class OverlayRowComputer {
     }
 
     private static int netSellAfterTax(int tps, int taxesPct) {
-        if (tps <= 0 || taxesPct <= 0)
-            return Math.max(0, tps);
+        if (taxesPct <= 0)
+            return tps;
         return (int) Math.floor(tps * (100.0 - OverlayHelper.clampPercent(taxesPct)) / 100.0);
     }
 
     private static void writeSpiritShardAugments(Map<String, Object> row, ComputeContext ctx) {
-        // Read base (already written) – we may override to 0 for Id==23
-        int baseBuy = OverlayHelper.toInt(row.get(OverlayHelper.COL_TPB), 0);
-        int baseSell = OverlayHelper.toInt(row.get(OverlayHelper.COL_TPS), 0);
+        int base_IS_TPB = OverlayHelper.toInt(row.get(OverlayHelper.COL_ITEM_SELL_TPBUY), 0);
+        int base_IB_TPB = OverlayHelper.toInt(row.get(OverlayHelper.COL_ITEM_BUY_TPBUY), 0);
+        int base_IS_TPS = OverlayHelper.toInt(row.get(OverlayHelper.COL_ITEM_SELL_TPSELL), 0);
+        int base_IB_TPS = OverlayHelper.toInt(row.get(OverlayHelper.COL_ITEM_BUY_TPSELL), 0);
 
         int itemId = OverlayHelper.toInt(row.get(OverlayHelper.COL_ID), -1);
         boolean isSpiritShardRow = (itemId == 23);
 
-        // Shard unit pair for current tier
         int[] shard = OverlaySpiritShard.getShardUnitPair(ctx.tier, ctx.priceByItemId);
-        int shardBuyUnit = (shard == null || shard.length < 1) ? 0 : Math.max(0, shard[0]);
-        int shardSellUnit = (shard == null || shard.length < 2) ? 0 : Math.max(0, shard[1]);
+        int shardBuyUnit = (shard == null || shard.length < 1) ? 0 : shard[0];
+        int shardSellUnit = (shard == null || shard.length < 2) ? 0 : shard[1];
 
-        // Delta = AverageAmount × shardUnit (per row)
         double avg = OverlayHelper.toDouble(row.get(OverlayHelper.COL_AVG), 1.0);
         int deltaBuy = (int) Math.round(avg * shardBuyUnit);
         int deltaSell = (int) Math.round(avg * shardSellUnit);
 
-        // Spirit Shard row: base must be zeroed
         if (isSpiritShardRow) {
-            baseBuy = 0;
-            baseSell = 0;
+            base_IS_TPB = base_IB_TPB = base_IS_TPS = base_IB_TPS = 0;
+
             if (ctx.isMain) {
-                // also zero Hr base if present
-                row.put(OverlayHelper.COL_TPB_HR, 0);
-                row.put(OverlayHelper.COL_TPS_HR, 0);
+                row.put(OverlayHelper.COL_ITEM_SELL_TPBUY_HR, 0);
+                row.put(OverlayHelper.COL_ITEM_BUY_TPBUY_HR, 0);
+                row.put(OverlayHelper.COL_ITEM_SELL_TPSELL_HR, 0);
+                row.put(OverlayHelper.COL_ITEM_BUY_TPSELL_HR, 0);
             }
-            // overwrite the base columns to 0 to be explicit
-            row.put(OverlayHelper.COL_TPB, 0);
-            row.put(OverlayHelper.COL_TPS, 0);
+
+            row.put(OverlayHelper.COL_ITEM_SELL_TPBUY, 0);
+            row.put(OverlayHelper.COL_ITEM_BUY_TPBUY, 0);
+            row.put(OverlayHelper.COL_ITEM_SELL_TPSELL, 0);
+            row.put(OverlayHelper.COL_ITEM_BUY_TPSELL, 0);
         }
 
-        // Write wSS base columns (always present in both detail & main)
-        int TPBuyProfitwSS = Math.max(0, baseBuy + deltaBuy);
-        int TPSellProfitwSS = Math.max(0, baseSell + deltaSell);
-        row.put("TPBuyProfitwSS", TPBuyProfitwSS);
-        row.put("TPSellProfitwSS", TPSellProfitwSS);
+        int IS_TPB_wSS = base_IS_TPB + deltaBuy;
+        int IB_TPB_wSS = base_IB_TPB + deltaBuy;
+        int IS_TPS_wSS = base_IS_TPS + deltaSell;
+        int IB_TPS_wSS = base_IB_TPS + deltaSell;
 
-        // Per-hour only for main tables
+        row.put(OverlayHelper.COL_ITEM_SELL_TPBUY_WSS, IS_TPB_wSS);
+        row.put(OverlayHelper.COL_ITEM_BUY_TPBUY_WSS, IB_TPB_wSS);
+        row.put(OverlayHelper.COL_ITEM_SELL_TPSELL_WSS, IS_TPS_wSS);
+        row.put(OverlayHelper.COL_ITEM_BUY_TPSELL_WSS, IB_TPS_wSS);
+
         if (ctx.isMain) {
             double hours = OverlayHelper.toDouble(row.get(OverlayHelper.COL_HOURS), 0.0);
-            int TPBuyProfitwSSHr = (hours > 0.0) ? (int) Math.floor(TPBuyProfitwSS / hours) : TPBuyProfitwSS;
-            int TPSellProfitwSSHr = (hours > 0.0) ? (int) Math.floor(TPSellProfitwSS / hours) : TPSellProfitwSS;
-            row.put("TPBuyProfitwSSHr", TPBuyProfitwSSHr);
-            row.put("TPSellProfitwSSHr", TPSellProfitwSSHr);
+
+            row.put(OverlayHelper.COL_ITEM_SELL_TPBUY_WSS_HR,
+                    (hours > 0.0) ? (int) Math.floor(IS_TPB_wSS / hours) : IS_TPB_wSS);
+            row.put(OverlayHelper.COL_ITEM_BUY_TPBUY_WSS_HR,
+                    (hours > 0.0) ? (int) Math.floor(IB_TPB_wSS / hours) : IB_TPB_wSS);
+            row.put(OverlayHelper.COL_ITEM_SELL_TPSELL_WSS_HR,
+                    (hours > 0.0) ? (int) Math.floor(IS_TPS_wSS / hours) : IS_TPS_wSS);
+            row.put(OverlayHelper.COL_ITEM_BUY_TPSELL_WSS_HR,
+                    (hours > 0.0) ? (int) Math.floor(IB_TPS_wSS / hours) : IB_TPS_wSS);
         }
     }
-
 }

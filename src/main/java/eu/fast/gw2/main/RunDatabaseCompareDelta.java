@@ -15,11 +15,30 @@ import java.util.Set;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 
 public class RunDatabaseCompareDelta {
     private static final ObjectMapper M = new ObjectMapper();
     // 90% tolerance for numeric comparisons
     private static final double REL_TOL = 0.90;
+
+    // Legacy (prod) fields
+    private static final String TPB = "TPBuyProfit";
+    private static final String TPS = "TPSellProfit";
+    private static final String TPB_HR = "TPBuyProfitHr";
+    private static final String TPS_HR = "TPSellProfitHr";
+
+    // New (test) 4-field schema
+    private static final String IB_TPB = "ItemBuyProfitTPBuyProfit";
+    private static final String IS_TPB = "ItemSellProfitTPBuyProfit";
+    private static final String IB_TPS = "ItemBuyProfitTPSellProfit";
+    private static final String IS_TPS = "ItemSellProfitTPSellProfit";
+
+    private static final String IB_TPB_HR = "ItemBuyProfitTPBuyProfitHr";
+    private static final String IS_TPB_HR = "ItemSellProfitTPBuyProfitHr";
+    private static final String IB_TPS_HR = "ItemBuyProfitTPSellProfitHr";
+    private static final String IS_TPS_HR = "ItemSellProfitTPSellProfitHr";
 
     public static void main(String[] args) throws Exception {
         String urlTest = "jdbc:postgresql://localhost:5433/fast_test";
@@ -67,7 +86,10 @@ public class RunDatabaseCompareDelta {
                 String j = rs.getString("rows");
                 if (j != null) {
                     try {
-                        out.put(k, M.readTree(j));
+                        JsonNode root = M.readTree(j);
+                        // Normalize both legacy and new payloads into a 4-field comparable shape
+                        normalizeTreeInPlace(root);
+                        out.put(k, root);
                     } catch (Exception e) {
                         System.err.println("bad JSON at " + k);
                     }
@@ -75,6 +97,66 @@ public class RunDatabaseCompareDelta {
             }
         }
         return out;
+    }
+
+    /**
+     * Normalize any row objects in the tree:
+     * - If legacy TP* fields exist, copy them into the 4 new Item* fields (and *Hr
+     * variants) if missing.
+     * - If new fields already exist, leave them as-is.
+     */
+    private static void normalizeTreeInPlace(JsonNode root) {
+        if (root == null || root.isNull())
+            return;
+
+        if (root.isArray()) {
+            ArrayNode arr = (ArrayNode) root;
+            for (JsonNode n : arr)
+                normalizeTreeInPlace(n);
+            return;
+        }
+
+        if (root.isObject()) {
+            ObjectNode o = (ObjectNode) root;
+
+            // Map TPBuyProfit -> ItemBuyProfitTPBuyProfit & ItemSellProfitTPBuyProfit
+            if (o.has(TPB) && !o.get(TPB).isNull()) {
+                JsonNode v = o.get(TPB);
+                if (!o.has(IB_TPB))
+                    o.set(IB_TPB, v.deepCopy());
+                if (!o.has(IS_TPB))
+                    o.set(IS_TPB, v.deepCopy());
+            }
+            // Map TPSellProfit -> ItemBuyProfitTPSellProfit & ItemSellProfitTPSellProfit
+            if (o.has(TPS) && !o.get(TPS).isNull()) {
+                JsonNode v = o.get(TPS);
+                if (!o.has(IB_TPS))
+                    o.set(IB_TPS, v.deepCopy());
+                if (!o.has(IS_TPS))
+                    o.set(IS_TPS, v.deepCopy());
+            }
+
+            // Per-hour (tables / mains) — do the same if present
+            if (o.has(TPB_HR) && !o.get(TPB_HR).isNull()) {
+                JsonNode v = o.get(TPB_HR);
+                if (!o.has(IB_TPB_HR))
+                    o.set(IB_TPB_HR, v.deepCopy());
+                if (!o.has(IS_TPB_HR))
+                    o.set(IS_TPB_HR, v.deepCopy());
+            }
+            if (o.has(TPS_HR) && !o.get(TPS_HR).isNull()) {
+                JsonNode v = o.get(TPS_HR);
+                if (!o.has(IB_TPS_HR))
+                    o.set(IB_TPS_HR, v.deepCopy());
+                if (!o.has(IS_TPS_HR))
+                    o.set(IS_TPS_HR, v.deepCopy());
+            }
+
+            // done for this object
+            return;
+        }
+
+        // primitives: nothing to do
     }
 
     private static void compare(Connection prod, Connection test,
@@ -146,7 +228,7 @@ public class RunDatabaseCompareDelta {
                         }
 
                         if (a != null && b != null && a.isObject() && b.isObject()) {
-                            // Compare ONLY fields present in base row (avoid overlay-only wSS noise)
+                            // Compare ONLY fields present in base row (avoid overlay-only noise)
                             Set<String> fields = new LinkedHashSet<>();
                             a.fieldNames().forEachRemaining(fields::add);
 
@@ -403,7 +485,7 @@ public class RunDatabaseCompareDelta {
     }
 
     // Record ignored headers and return true if header should be ignored.
-    // NOTE: TP* is NOT ignored anymore.
+    // NOTE: You said you'll toggle these dynamically; leaving as-is.
     private static boolean markIfIgnored(String field, Set<String> ignoredHeadersSeen) {
         if (field == null)
             return false;

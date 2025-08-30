@@ -76,15 +76,23 @@ public class OverlayCalc {
     }
 
     public static int pickTaxesPercent(String category, String key, CalculationsDao.Config tableCfg) {
+        // NEW: NEGATIVE rows are never taxed (exact, case-sensitive match)
+        if ("NEGATIVE".equals(category))
+            return 0;
+
         if (OverlayHelper.isInternal(category))
             return 0;
+
         if (category != null && !category.isBlank() && key != null && !key.isBlank())
             return 0; // composite ref
+
         var rowCfg = getCalcCfg(category, key);
         if (rowCfg != null)
             return OverlayHelper.clampPercent(rowCfg.taxes());
+
         if (tableCfg != null)
             return OverlayHelper.clampPercent(tableCfg.taxes());
+
         return 15;
     }
 

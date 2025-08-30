@@ -32,23 +32,41 @@ public final class OverlayProblemLog {
         if (samples.size() < maxSamples) {
             int id = OverlayHelper.toInt(row.get(OverlayHelper.COL_ID), -1);
             String name = OverlayHelper.str(row.get(OverlayHelper.COL_NAME));
-            Integer b = OverlayHelper.toIntBoxed(row.get(OverlayHelper.COL_TPB));
-            Integer s = OverlayHelper.toIntBoxed(row.get(OverlayHelper.COL_TPS));
+
+            Integer ib_tpb = OverlayHelper.toIntBoxed(row.get(OverlayHelper.COL_ITEM_BUY_TPBUY));
+            Integer is_tpb = OverlayHelper.toIntBoxed(row.get(OverlayHelper.COL_ITEM_SELL_TPBUY));
+            Integer ib_tps = OverlayHelper.toIntBoxed(row.get(OverlayHelper.COL_ITEM_BUY_TPSELL));
+            Integer is_tps = OverlayHelper.toIntBoxed(row.get(OverlayHelper.COL_ITEM_SELL_TPSELL));
+
             Double avg = OverlayHelper.toDouble(row.get(OverlayHelper.COL_AVG), 0.0);
+
             samples.add(String.format(java.util.Locale.ROOT,
-                    "{reason:%s, isMain:%s, table:'%s', fid:%s, row:%d, id:%d, name:'%s', cat:'%s', key:'%s', TPB:%s, TPS:%s, avg:%.3f, taxes:%d}",
+                    "{reason:%s, isMain:%s, table:'%s', fid:%s, row:%d, id:%d, name:'%s', cat:'%s', key:'%s', "
+                            + "IB_TPB:%s, IS_TPB:%s, IB_TPS:%s, IS_TPS:%s, avg:%.3f, taxes:%d}",
                     reason, isMain, tableKey, (fid == null ? "null" : fid.toString()), rowIndex, id,
                     String.valueOf(name), String.valueOf(cat), String.valueOf(key),
-                    String.valueOf(b), String.valueOf(s), avg, taxesPct));
+                    String.valueOf(ib_tpb), String.valueOf(is_tpb),
+                    String.valueOf(ib_tps), String.valueOf(is_tps),
+                    avg, taxesPct));
         }
     }
 
     public synchronized void recordIfZero(boolean isMain, String tableKey, Long fid, int rowIndex,
             Map<String, Object> row, int taxesPct, String reason) {
-        int b = Math.max(0, OverlayHelper.toInt(row.get(OverlayHelper.COL_TPB), 0));
-        int s = Math.max(0, OverlayHelper.toInt(row.get(OverlayHelper.COL_TPS), 0));
-        if (b == 0 && s == 0)
+
+        // Skip zero-problem logging for UNTOUCHED rows entirely.
+        String cat = OverlayHelper.str(row.get(OverlayHelper.COL_CAT));
+        if ("UNTOUCHED".equals(cat))
+            return;
+
+        int ib_tpb = OverlayHelper.toInt(row.get(OverlayHelper.COL_ITEM_BUY_TPBUY), 0);
+        int is_tpb = OverlayHelper.toInt(row.get(OverlayHelper.COL_ITEM_SELL_TPBUY), 0);
+        int ib_tps = OverlayHelper.toInt(row.get(OverlayHelper.COL_ITEM_BUY_TPSELL), 0);
+        int is_tps = OverlayHelper.toInt(row.get(OverlayHelper.COL_ITEM_SELL_TPSELL), 0);
+
+        if (ib_tpb == 0 && is_tpb == 0 && ib_tps == 0 && is_tps == 0) {
             record(isMain, tableKey, fid, rowIndex, row, taxesPct, reason);
+        }
     }
 
     public synchronized void printSummary() {
