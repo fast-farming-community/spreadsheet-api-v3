@@ -271,9 +271,10 @@ public class SeedCalculations {
         for (int i = 0; i < rows.size(); i += CHUNK_SIZE_UPSERT) {
             List<RowFormulas> chunk = rows.subList(i, Math.min(rows.size(), i + CHUNK_SIZE_UPSERT));
             total += Jpa.tx(em -> {
+                // NOTE: third column (operation) is a bind (?::text) — we'll pass "" (empty).
                 String values = chunk.stream()
-                        .map(r -> "(?::text, ?::text, NULL, ?::int, NULL, ?::jsonb, ?::text)")
-                        .collect(Collectors.joining(","));
+                        .map(r -> "(?::text, ?::text, ?::text, ?::int, NULL, ?::jsonb, ?::text)")
+                        .collect(java.util.stream.Collectors.joining(","));
                 String sql = """
                         INSERT INTO public.calculations
                               (category, key, operation, taxes, source_table_key, formulas_json, notes)
@@ -292,7 +293,10 @@ public class SeedCalculations {
                 for (RowFormulas r : chunk) {
                     q.setParameter(idx++, r.category);
                     q.setParameter(idx++, r.key);
-                    q.setParameter(idx++, r.taxesOrDefault);
+                    // Write empty (but NOT NULL) operation — aggregation is decided at runtime by
+                    // Datasets.
+                    q.setParameter(idx++, "");
+                    q.setParameter(idx++, r.taxesOrDefault == null ? DEFAULT_TAXES : r.taxesOrDefault);
                     q.setParameter(idx++, r.formulasJson);
                     q.setParameter(idx++, r.notes);
                 }
