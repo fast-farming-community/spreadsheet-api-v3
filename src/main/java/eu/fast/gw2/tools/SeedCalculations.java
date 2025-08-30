@@ -1,8 +1,10 @@
+// REPLACE ENTIRE FILE: eu.fast.gw2.tools.SeedCalculations
 package eu.fast.gw2.tools;
 
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -18,15 +20,27 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 /**
  * Seed calculations using the DB structure as the source of truth.
  *
- * Writes ONLY formulas_json (and taxes/notes). NEVER touches operation.
- * Runtime will derive and persist operation from the "Datasets" column.
+ * - Writes formulas_json (and taxes/notes) for all DB-backed (category,key)
+ * pairs.
+ * - Scans tables.rows & detail_tables.rows and derives operation from each
+ * COMPOSITE row’s Datasets:
+ * * "static" -> MAX
+ * * number -> SUM (numeric string also counts; zero counts as SUM)
+ * * mixed across callers of SAME (Category,Key) -> choose MAX and warn.
+ * - Applies defaults for UNREFERENCED DB pairs:
+ * * INTERNAL/* -> MAX
+ * * detail -> SUM
+ * - Orphans (in JSON but not DB) are upserted with mode + derived/default
+ * operation.
  */
 public class SeedCalculations {
 
     private static final String COL_CAT = "Category";
     private static final String COL_KEY = "Key";
+    private static final String COL_DATASETS = "Datasets";
 
     private static final String NOTES_PREFIX_DSL = "auto-seed:strict-dsl";
+    private static final String NOTES_PREFIX_OP = "auto-seed:op-from-datasets";
 
     private static final ObjectMapper M = new ObjectMapper();
 
@@ -37,7 +51,7 @@ public class SeedCalculations {
         Log.section("SeedCalculations: start");
         Instant t0 = Instant.now();
 
-        // ---------- 1) Load JSON blobs (reporting only) ----------
+        // ---------- 1) Load JSON blobs ----------
         List<Object[]> detailTables = Jpa.tx(em -> em.createNativeQuery("""
                         SELECT id, key, rows
                           FROM public.detail_tables
@@ -53,15 +67,17 @@ public class SeedCalculations {
         Log.info("Loaded JSON sources: detail_tables=%d, tables=%d (%.3fs)",
                 detailTables.size(), mainTables.size(), secSince(t0));
 
-        // ---------- 2) Discover (Category, Key) from JSON (reporting only) ----------
+        // ---------- 2) Discover all JSON pairs (reporting) & derive ops from Datasets
+        // ----------
         Instant t1 = Instant.now();
-        Set<Pair> jsonPairs = discoverPairsFromJsonOnly(detailTables, mainTables);
-        Log.info("Discovered from JSON (Category,Key) pairs: %d (%.3fs)", jsonPairs.size(), secSince(t1));
+        final JsonScanResult scan = scanJsonForPairsAndOps(detailTables, mainTables);
+        Log.info("JSON discovery: pairs=%d, withDerivedOps=%d (%.3fs)",
+                scan.allJsonPairs.size(), scan.derivedOps.size(), secSince(t1));
 
-        // ---------- 3) Load DB pairs (source of truth for seeding) ----------
+        // ---------- 3) Load DB pairs (source of truth for seeding formulas) ----------
         Instant t2 = Instant.now();
         Set<Pair> dbPairs = loadDbPairs();
-        Log.info("Discovered from DB (Category,Key) pairs: %d (%.3fs)", dbPairs.size(), secSince(t2));
+        Log.info("DB pairs: %d (%.3fs)", dbPairs.size(), secSince(t2));
 
         // ---------- 4) Load existing calculations once ----------
         Instant t3 = Instant.now();
@@ -82,25 +98,15 @@ public class SeedCalculations {
         });
         Log.info("Loaded existing calculations: %d (%.3fs)", existingCalc.size(), secSince(t3));
 
-        // ---------- 5) Plan formulas writes (batched) ----------
+        // ---------- 5) Seed strict-DSL formulas for DB-backed pairs (batched)
+        // ----------
         Instant t4 = Instant.now();
 
         List<RowFormulas> needInsertF = new ArrayList<>();
         List<RowFormulas> needUpdateF = new ArrayList<>();
 
         // Ensure LEAF pair ("","") exists with mode=LEAF
-        final Pair LEAF = new Pair("", "");
-        final Existing exLeaf = existingCalc.get(LEAF.norm());
-        final String leafFjson = "{\"mode\":\"LEAF\"}";
-        if (exLeaf == null) {
-            needInsertF.add(new RowFormulas("", "", leafFjson,
-                    DEFAULT_TAXES, NOTES_PREFIX_DSL + " (mode=LEAF)"));
-            existingCalc.put(LEAF.norm(), new Existing(true));
-        } else if (!exLeaf.hasFormulas) {
-            needUpdateF.add(new RowFormulas("", "", leafFjson,
-                    null, NOTES_PREFIX_DSL + " (mode=LEAF)"));
-            exLeaf.hasFormulas = true;
-        }
+        ensureLeafFormulas(existingCalc, needInsertF, needUpdateF);
 
         // Seed ALL DB pairs with INTERNAL/COMPOSITE modes (formulas only)
         for (Pair p : dbPairs) {
@@ -119,79 +125,152 @@ public class SeedCalculations {
             }
         }
 
-        Log.info("Plan -> F:+%d ~%d (%.3fs)",
+        Log.info("Plan formulas -> inserts=%d updates=%d (%.3fs)",
                 needInsertF.size(), needUpdateF.size(), secSince(t4));
 
-        // ---------- 6) Apply batched writes ----------
+        // Apply those writes
         Instant t5 = Instant.now();
         int insF = execInsertFormulas(needInsertF);
         int updF = execUpdateFormulas(needUpdateF);
-        Log.info("Applied calculations (%.3fs): +F=%d ~F=%d",
+        Log.info("Applied formulas (%.3fs): +F=%d ~F=%d",
                 secSince(t5), insF, updF);
 
-        // ---------- 7) Report DB vs JSON references (no writes) ----------
+        // ---------- 6) Build desired operations ----------
+        // Start with ops derived from Datasets across ALL JSON callers.
+        Map<Pair, String> desiredOps = new LinkedHashMap<>(scan.derivedOps);
+
+        // Add defaults for DB pairs that had no JSON references:
+        Set<Pair> unrefDb = new LinkedHashSet<>(dbPairs);
+        unrefDb.removeAll(scan.referencedByJson);
+        for (Pair p : unrefDb) {
+            if (eqi(p.category(), "INTERNAL"))
+                desiredOps.putIfAbsent(p.norm(), "MAX");
+            else
+                desiredOps.putIfAbsent(p.norm(), "SUM");
+        }
+
+        // Orphans: in JSON but not in DB (we still upsert calculations rows for these)
+        Orphans orphans = findOrphans(dbPairs, scan.allJsonPairs);
+        Log.info("Orphans: internal=%d, detail=%d", orphans.internalPairs.size(), orphans.detailPairs.size());
+
+        // ---------- 7) Upsert operations (and ensure formulas exist on insert)
+        // ----------
         Instant t6 = Instant.now();
-        logReferenceDiffs(dbPairs, jsonPairs);
-        Log.info("Reference reporting done (%.3fs)", secSince(t6));
+        int upOp = execUpsertOperations(desiredOps, orphans);
+        Log.info("Upserted operations (%.3fs): %d rows", secSince(t6), upOp);
+
+        // ---------- 8) Reporting ----------
+        logReferenceDiffs(dbPairs, scan.allJsonPairs);
 
         Log.section("SeedCalculations: complete (total %.3fs)", secSince(t0));
     }
 
-    // ---------- JSON discovery (reporting only; accept LEAF as only exception)
-    // ----------
-    private static Set<Pair> discoverPairsFromJsonOnly(
+    // ======== JSON scan: collect all pairs and derive operations from Datasets
+    // ========
+    private static JsonScanResult scanJsonForPairsAndOps(
             List<Object[]> detailTables, List<Object[]> mainTables) {
-        Set<Pair> jsonPairs = new LinkedHashSet<>();
-        int jsonErrors = 0;
 
-        java.util.function.Consumer<List<Map<String, Object>>> collect = rows -> {
+        Set<Pair> allPairs = new LinkedHashSet<>();
+        Set<Pair> referenced = new LinkedHashSet<>();
+        Map<Pair, Flag> flagsByPair = new HashMap<>();
+
+        java.util.function.Consumer<List<Map<String, Object>>> visitRows = rows -> {
             for (var r : rows) {
                 String cat = str(r.get(COL_CAT));
                 String key = str(r.get(COL_KEY));
-
                 if (isBlank(cat) && isBlank(key)) {
-                    jsonPairs.add(new Pair("", "")); // LEAF
-                } else if (!isBlank(cat) && !isBlank(key)) {
-                    jsonPairs.add(new Pair(cat.trim(), key.trim()));
+                    allPairs.add(new Pair("", "")); // LEAF
+                    continue;
+                }
+                if (isBlank(cat) || isBlank(key))
+                    continue; // skip plain items etc.
+
+                Pair p = new Pair(cat.trim(), key.trim()).norm();
+                allPairs.add(p);
+                referenced.add(p);
+
+                Object ds = r.get(COL_DATASETS);
+                if (ds == null)
+                    continue;
+
+                // Record flags for this pair based on Datasets value.
+                Flag f = flagsByPair.computeIfAbsent(p, k -> new Flag());
+                if (ds instanceof Number) {
+                    f.numeric = true;
+                } else {
+                    String s = String.valueOf(ds).trim();
+                    if ("static".equalsIgnoreCase(s)) {
+                        f.stat = true;
+                    } else if (s.matches("^-?\\d+(\\.\\d+)?$")) {
+                        f.numeric = true;
+                    }
                 }
             }
         };
 
+        // scan detail_tables.rows
         for (Object[] t : detailTables) {
-            long id = ((Number) t[0]).longValue();
-            String k = (String) t[1];
             String js = (String) t[2];
             if (isBlank(js))
                 continue;
             try {
                 List<Map<String, Object>> rows = M.readValue(js, new TypeReference<>() {
                 });
-                collect.accept(rows);
+                visitRows.accept(rows);
             } catch (Exception e) {
-                if (++jsonErrors <= 5)
-                    Log.warn("JSON parse failed for detail_tables.id=%d key=%s: %s", id, k, e.getMessage());
+                Log.warn("JSON parse failed for detail_tables.id=%s key=%s: %s", t[0], t[1], e.getMessage());
             }
         }
 
+        // scan tables.rows
         for (Object[] t : mainTables) {
-            long id = ((Number) t[0]).longValue();
             String js = (String) t[1];
             if (isBlank(js))
                 continue;
             try {
                 List<Map<String, Object>> rows = M.readValue(js, new TypeReference<>() {
                 });
-                collect.accept(rows);
+                visitRows.accept(rows);
             } catch (Exception e) {
-                if (++jsonErrors <= 5)
-                    Log.warn("JSON parse failed for tables.id=%d: %s", id, e.getMessage());
+                Log.warn("JSON parse failed for tables.id=%s: %s", t[0], e.getMessage());
             }
         }
 
-        return jsonPairs;
+        // Collapse flags -> operations per (Category,Key)
+        Map<Pair, String> derivedOps = new LinkedHashMap<>();
+        for (var e : flagsByPair.entrySet()) {
+            Pair p = e.getKey();
+            Flag f = e.getValue();
+            String op;
+            if (f.stat && f.numeric) {
+                Log.warn("Mixed Datasets across callers for (%s|%s): static + numeric -> choosing MAX",
+                        p.category(), p.key());
+                op = "MAX";
+            } else if (f.stat) {
+                op = "MAX";
+            } else if (f.numeric) {
+                op = "SUM";
+            } else {
+                continue;
+            }
+            derivedOps.put(p, op);
+        }
+
+        return new JsonScanResult(allPairs, referenced, derivedOps);
     }
 
-    // ---------- DB discovery (source of truth for seeding) ----------
+    private static class Flag {
+        boolean stat = false;
+        boolean numeric = false;
+    }
+
+    private record JsonScanResult(
+            Set<Pair> allJsonPairs,
+            Set<Pair> referencedByJson,
+            Map<Pair, String> derivedOps) {
+    }
+
+    // ======== DB discovery ========
     private static Set<Pair> loadDbPairs() {
         Set<Pair> internal = Jpa.tx(em -> {
             List<?> rows = em.createNativeQuery("""
@@ -222,47 +301,62 @@ public class SeedCalculations {
         return all;
     }
 
-    // ---------- reporting ----------
-    private static void logReferenceDiffs(Set<Pair> dbPairs, Set<Pair> jsonPairs) {
+    // ======== Orphans (JSON minus DB) ========
+    private static Orphans findOrphans(Set<Pair> dbPairs, Set<Pair> jsonPairs) {
         java.util.function.Predicate<Pair> isInternal = p -> eqi(p.category(), "INTERNAL") && !isBlank(p.key());
         java.util.function.Predicate<Pair> isDetail = p -> !eqi(p.category(), "INTERNAL") && !isBlank(p.category())
                 && !isBlank(p.key());
-
-        Set<String> dbInternal = dbPairs.stream().filter(isInternal).map(Pair::key)
-                .collect(Collectors.toCollection(LinkedHashSet::new));
-        Set<String> jsInternal = jsonPairs.stream().filter(isInternal).map(Pair::key)
-                .collect(Collectors.toCollection(LinkedHashSet::new));
 
         Set<Pair> dbDetail = dbPairs.stream().filter(isDetail).map(Pair::norm)
                 .collect(Collectors.toCollection(LinkedHashSet::new));
         Set<Pair> jsDetail = jsonPairs.stream().filter(isDetail).map(Pair::norm)
                 .collect(Collectors.toCollection(LinkedHashSet::new));
 
-        Set<String> internalUnref = new LinkedHashSet<>(dbInternal);
-        internalUnref.removeAll(jsInternal);
-        Set<Pair> detailUnref = new LinkedHashSet<>(dbDetail);
-        detailUnref.removeAll(jsDetail);
+        Set<String> dbInternal = dbPairs.stream().filter(isInternal).map(Pair::key)
+                .collect(Collectors.toCollection(LinkedHashSet::new));
+        Set<String> jsInternal = jsonPairs.stream().filter(isInternal).map(Pair::key)
+                .collect(Collectors.toCollection(LinkedHashSet::new));
 
-        Set<String> internalOrphan = new LinkedHashSet<>(jsInternal);
-        internalOrphan.removeAll(dbInternal);
         Set<Pair> detailOrphan = new LinkedHashSet<>(jsDetail);
         detailOrphan.removeAll(dbDetail);
 
-        Log.section("Reference check (DB vs JSON)");
-        Log.info("INTERNAL: unreferenced=%d, orphan=%d", internalUnref.size(), internalOrphan.size());
-        for (String k : internalUnref)
-            Log.info("UNREFERENCED INTERNAL: %s", k);
-        for (String k : internalOrphan)
-            Log.info("ORPHAN INTERNAL     : %s", k);
+        Set<String> internalOrphan = new LinkedHashSet<>(jsInternal);
+        internalOrphan.removeAll(dbInternal);
 
-        Log.info("DETAIL  : unreferenced=%d, orphan=%d", detailUnref.size(), detailOrphan.size());
-        for (Pair p : detailUnref)
-            Log.info("UNREFERENCED DETAIL: %s :: %s", p.category(), p.key());
-        for (Pair p : detailOrphan)
-            Log.info("ORPHAN DETAIL     : %s :: %s", p.category(), p.key());
+        Set<Pair> internalOrphanPairs = internalOrphan.stream()
+                .map(k -> new Pair("INTERNAL", k)).collect(Collectors.toCollection(LinkedHashSet::new));
+
+        return new Orphans(internalOrphanPairs, detailOrphan);
     }
 
-    // ---------- formulas writers (batched) ----------
+    private static class Orphans {
+        final Set<Pair> internalPairs; // INTERNAL/k
+        final Set<Pair> detailPairs; // (cat,key)
+
+        Orphans(Set<Pair> internal, Set<Pair> detail) {
+            this.internalPairs = internal;
+            this.detailPairs = detail;
+        }
+    }
+
+    // ======== Formulas seeding ========
+    private static void ensureLeafFormulas(Map<Pair, Existing> existingCalc,
+            List<RowFormulas> needInsertF,
+            List<RowFormulas> needUpdateF) {
+        final Pair LEAF = new Pair("", "");
+        final Existing exLeaf = existingCalc.get(LEAF.norm());
+        final String leafFjson = "{\"mode\":\"LEAF\"}";
+        if (exLeaf == null) {
+            needInsertF.add(new RowFormulas("", "", leafFjson,
+                    DEFAULT_TAXES, NOTES_PREFIX_DSL + " (mode=LEAF)"));
+            existingCalc.put(LEAF.norm(), new Existing(true));
+        } else if (!exLeaf.hasFormulas) {
+            needUpdateF.add(new RowFormulas("", "", leafFjson,
+                    null, NOTES_PREFIX_DSL + " (mode=LEAF)"));
+            exLeaf.hasFormulas = true;
+        }
+    }
+
     private static int execInsertFormulas(List<RowFormulas> rows) {
         if (rows.isEmpty())
             return 0;
@@ -270,7 +364,6 @@ public class SeedCalculations {
         for (int i = 0; i < rows.size(); i += CHUNK_SIZE_UPSERT) {
             List<RowFormulas> chunk = rows.subList(i, Math.min(rows.size(), i + CHUNK_SIZE_UPSERT));
             total += Jpa.tx(em -> {
-                // NOTE: third column (operation) is a bind (?::text) — we'll pass "" (empty).
                 String values = chunk.stream()
                         .map(r -> "(?::text, ?::text, ?::text, ?::int, NULL, ?::jsonb, ?::text)")
                         .collect(java.util.stream.Collectors.joining(","));
@@ -292,8 +385,7 @@ public class SeedCalculations {
                 for (RowFormulas r : chunk) {
                     q.setParameter(idx++, r.category);
                     q.setParameter(idx++, r.key);
-                    // Write empty (but NOT NULL) operation — aggregation is decided at runtime by
-                    // Datasets.
+                    // leave operation empty here; ops are handled in their own upsert step
                     q.setParameter(idx++, "");
                     q.setParameter(idx++, r.taxesOrDefault == null ? DEFAULT_TAXES : r.taxesOrDefault);
                     q.setParameter(idx++, r.formulasJson);
@@ -339,8 +431,119 @@ public class SeedCalculations {
         return total;
     }
 
-    // ---------- models & utils ----------
+    // ======== Operations upsert (derived from Datasets + defaults + orphans)
+    // ========
+    private static int execUpsertOperations(Map<Pair, String> desiredOps, Orphans orphans) {
+        if (desiredOps.isEmpty() && orphans.detailPairs.isEmpty() && orphans.internalPairs.isEmpty())
+            return 0;
+
+        List<RowWithOp> rows = new ArrayList<>();
+
+        // desiredOps for all pairs (DB-backed or not). We'll also ensure formulas on
+        // insert.
+        for (var e : desiredOps.entrySet()) {
+            Pair p = e.getKey();
+            String op = e.getValue();
+            String mode = eqi(p.category(), "INTERNAL") ? "INTERNAL" : "COMPOSITE";
+            rows.add(new RowWithOp(p.category(), p.key(), op,
+                    "{\"mode\":\"" + mode + "\"}", DEFAULT_TAXES,
+                    NOTES_PREFIX_OP + " (from Datasets)"));
+        }
+
+        // Make sure pure orphans with no desired op still get defaults.
+        for (Pair p : orphans.internalPairs) {
+            rows.add(new RowWithOp(p.category(), p.key(), "MAX",
+                    "{\"mode\":\"INTERNAL\"}", DEFAULT_TAXES,
+                    NOTES_PREFIX_OP + " (orphan default INTERNAL=MAX)"));
+        }
+        for (Pair p : orphans.detailPairs) {
+            rows.add(new RowWithOp(p.category(), p.key(), "SUM",
+                    "{\"mode\":\"COMPOSITE\"}", DEFAULT_TAXES,
+                    NOTES_PREFIX_OP + " (orphan default DETAIL=SUM)"));
+        }
+
+        if (rows.isEmpty())
+            return 0;
+
+        int total = 0;
+        for (int i = 0; i < rows.size(); i += CHUNK_SIZE_UPSERT) {
+            List<RowWithOp> chunk = rows.subList(i, Math.min(rows.size(), i + CHUNK_SIZE_UPSERT));
+            total += Jpa.tx(em -> {
+                String values = chunk.stream()
+                        .map(r -> "(?::text, ?::text, ?::text, ?::int, NULL, ?::jsonb, ?::text)")
+                        .collect(java.util.stream.Collectors.joining(","));
+                String sql = """
+                        INSERT INTO public.calculations
+                              (category, key, operation, taxes, source_table_key, formulas_json, notes)
+                        VALUES """ + values + """
+                         ON CONFLICT (category, key) DO UPDATE
+                             SET operation     = EXCLUDED.operation,
+                                 formulas_json = COALESCE(public.calculations.formulas_json, EXCLUDED.formulas_json),
+                                 taxes         = COALESCE(public.calculations.taxes, EXCLUDED.taxes),
+                                 notes         = public.calculations.notes
+                        """;
+                var q = em.createNativeQuery(sql);
+                int idx = 1;
+                for (RowWithOp r : chunk) {
+                    q.setParameter(idx++, r.category);
+                    q.setParameter(idx++, r.key);
+                    q.setParameter(idx++, r.operation);
+                    q.setParameter(idx++, r.taxesOrDefault == null ? DEFAULT_TAXES : r.taxesOrDefault);
+                    q.setParameter(idx++, r.formulasJson);
+                    q.setParameter(idx++, r.notes);
+                }
+                return q.executeUpdate();
+            });
+        }
+        return total;
+    }
+
+    // ======== Reporting ========
+    private static void logReferenceDiffs(Set<Pair> dbPairs, Set<Pair> jsonPairs) {
+        java.util.function.Predicate<Pair> isInternal = p -> eqi(p.category(), "INTERNAL") && !isBlank(p.key());
+        java.util.function.Predicate<Pair> isDetail = p -> !eqi(p.category(), "INTERNAL") && !isBlank(p.category())
+                && !isBlank(p.key());
+
+        Set<String> dbInternal = dbPairs.stream().filter(isInternal).map(Pair::key)
+                .collect(Collectors.toCollection(LinkedHashSet::new));
+        Set<String> jsInternal = jsonPairs.stream().filter(isInternal).map(Pair::key)
+                .collect(Collectors.toCollection(LinkedHashSet::new));
+
+        Set<Pair> dbDetail = dbPairs.stream().filter(isDetail).map(Pair::norm)
+                .collect(Collectors.toCollection(LinkedHashSet::new));
+        Set<Pair> jsDetail = jsonPairs.stream().filter(isDetail).map(Pair::norm)
+                .collect(Collectors.toCollection(LinkedHashSet::new));
+
+        Set<String> internalUnref = new LinkedHashSet<>(dbInternal);
+        internalUnref.removeAll(jsInternal);
+        Set<Pair> detailUnref = new LinkedHashSet<>(dbDetail);
+        detailUnref.removeAll(jsDetail);
+
+        Set<String> internalOrphan = new LinkedHashSet<>(jsInternal);
+        internalOrphan.removeAll(dbInternal);
+        Set<Pair> detailOrphan = new LinkedHashSet<>(jsDetail);
+        detailOrphan.removeAll(dbDetail);
+
+        Log.section("Reference check (DB vs JSON)");
+        Log.info("INTERNAL: unreferenced=%d, orphan=%d", internalUnref.size(), internalOrphan.size());
+        for (String k : internalUnref)
+            Log.info("UNREFERENCED INTERNAL: %s", k);
+        for (String k : internalOrphan)
+            Log.info("ORPHAN INTERNAL     : %s", k);
+
+        Log.info("DETAIL  : unreferenced=%d, orphan=%d", detailUnref.size(), detailOrphan.size());
+        for (Pair p : detailUnref)
+            Log.info("UNREFERENCED DETAIL: %s :: %s", p.category(), p.key());
+        for (Pair p : detailOrphan)
+            Log.info("ORPHAN DETAIL     : %s :: %s", p.category(), p.key());
+    }
+
+    // ======== Models & utils ========
     private record RowFormulas(String category, String key, String formulasJson, Integer taxesOrDefault, String notes) {
+    }
+
+    private record RowWithOp(String category, String key, String operation, String formulasJson, Integer taxesOrDefault,
+            String notes) {
     }
 
     private static class Existing {
@@ -368,6 +571,14 @@ public class SeedCalculations {
         @Override
         public int hashCode() {
             return Objects.hash(n(category), n(key));
+        }
+
+        public String category() {
+            return category;
+        }
+
+        public String key() {
+            return key;
         }
     }
 
