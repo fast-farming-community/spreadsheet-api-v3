@@ -27,9 +27,9 @@ import com.fasterxml.jackson.databind.ObjectMapper;
  * * "static" -> MAX
  * * number -> SUM (numeric string also counts; zero counts as SUM)
  * * mixed across callers of SAME (Category,Key) -> choose MAX and warn.
- * - Applies defaults for UNREFERENCED DB pairs:
+ * - Applies defaults for pairs without a derived op:
  * * INTERNAL/* -> MAX
- * * detail -> SUM
+ * * others -> SUM
  * - Orphans (in JSON but not DB) are upserted with mode + derived/default
  * operation.
  */
@@ -139,14 +139,17 @@ public class SeedCalculations {
         // Start with ops derived from Datasets across ALL JSON callers.
         Map<Pair, String> desiredOps = new LinkedHashMap<>(scan.derivedOps);
 
-        // Add defaults for DB pairs that had no JSON references:
+        // A) Defaults for DB pairs that were referenced in JSON but had NO derived op
+        // (this was the hole that left operation empty).
+        for (Pair p : scan.referencedByJson) {
+            desiredOps.putIfAbsent(p.norm(), defaultOpFor(p));
+        }
+
+        // B) Defaults for DB pairs that had NO JSON reference at all
         Set<Pair> unrefDb = new LinkedHashSet<>(dbPairs);
         unrefDb.removeAll(scan.referencedByJson);
         for (Pair p : unrefDb) {
-            if (eqi(p.category(), "INTERNAL"))
-                desiredOps.putIfAbsent(p.norm(), "MAX");
-            else
-                desiredOps.putIfAbsent(p.norm(), "SUM");
+            desiredOps.putIfAbsent(p.norm(), defaultOpFor(p));
         }
 
         // Orphans: in JSON but not in DB (we still upsert calculations rows for these)
@@ -178,12 +181,16 @@ public class SeedCalculations {
             for (var r : rows) {
                 String cat = str(r.get(COL_CAT));
                 String key = str(r.get(COL_KEY));
+
+                // LEAF marker (skip for ops)
                 if (isBlank(cat) && isBlank(key)) {
                     allPairs.add(new Pair("", "")); // LEAF
                     continue;
                 }
+
+                // Only composites (both present) are relevant for ops
                 if (isBlank(cat) || isBlank(key))
-                    continue; // skip plain items etc.
+                    continue;
 
                 Pair p = new Pair(cat.trim(), key.trim()).norm();
                 allPairs.add(p);
@@ -299,6 +306,11 @@ public class SeedCalculations {
         all.addAll(internal);
         all.addAll(detail);
         return all;
+    }
+
+    // ======== Defaults ========
+    private static String defaultOpFor(Pair p) {
+        return eqi(p.category(), "INTERNAL") ? "MAX" : "SUM";
     }
 
     // ======== Orphans (JSON minus DB) ========
@@ -447,7 +459,7 @@ public class SeedCalculations {
             String mode = eqi(p.category(), "INTERNAL") ? "INTERNAL" : "COMPOSITE";
             rows.add(new RowWithOp(p.category(), p.key(), op,
                     "{\"mode\":\"" + mode + "\"}", DEFAULT_TAXES,
-                    NOTES_PREFIX_OP + " (from Datasets)"));
+                    NOTES_PREFIX_OP + " (from Datasets/default)"));
         }
 
         // Make sure pure orphans with no desired op still get defaults.
