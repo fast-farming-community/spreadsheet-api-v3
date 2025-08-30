@@ -1,4 +1,3 @@
-// REPLACE ENTIRE FILE: eu.fast.gw2.tools.OverlayTierRunner
 package eu.fast.gw2.tools;
 
 import java.util.Collections;
@@ -125,7 +124,8 @@ public final class OverlayTierRunner implements Runnable {
                     OverlayRowComputer.computeRow(rows.get(i), ctx, i, prof, problems);
 
                 // ---- INTERNAL vs COMPOSITE:
-                // INTERNAL should always be MAX; Datasets logic applies ONLY to COMPOSITE rows.
+                // INTERNAL (in detail) must force MAX; only scan Datasets for COMPOSITE when
+                // there is no INTERNAL.
                 decideAndPersistOpCompositeOnly(rows, "detail", key, tableCategory, key);
 
                 writer.enqueueDetail(fid, key, t.label, OverlayJson.toJson(rows));
@@ -206,10 +206,10 @@ public final class OverlayTierRunner implements Runnable {
 
     // ========================================================================
     // INTERNAL vs COMPOSITE op decision:
-    // - If there are COMPOSITE rows -> decide via Datasets (only over COMPOSITE).
-    // - Else if there are INTERNAL rows -> op = MAX.
+    // - If table has ANY INTERNAL rows -> op = MAX (do NOT scan Datasets).
+    // - Else if table has COMPOSITE rows -> decide via Datasets over COMPOSITE rows
+    // only.
     // - Else -> op = SUM (quiet default).
-    // Persists the chosen op and applies it to the table rows.
     // ========================================================================
     private static void decideAndPersistOpCompositeOnly(
             List<Map<String, Object>> rows,
@@ -219,15 +219,13 @@ public final class OverlayTierRunner implements Runnable {
             String calcKey) {
 
         if (rows == null || rows.isEmpty()) {
-            System.out.printf(java.util.Locale.ROOT,
-                    "Overlay AGG: %s '%s' has no rows -> skip aggregation%n", kind, tableKey);
+            // nothing to do
             return;
         }
 
         boolean hasInternal = false;
         boolean hasComposite = false;
 
-        // Pre-scan to know which path to take
         for (Map<String, Object> r : rows) {
             if (r == null)
                 continue;
@@ -235,25 +233,24 @@ public final class OverlayTierRunner implements Runnable {
             String key = OverlayHelper.str(r.get(OverlayHelper.COL_KEY));
             if ("NEGATIVE".equalsIgnoreCase(category) || "UNCHECKED".equalsIgnoreCase(category))
                 continue;
-            if (OverlayHelper.isCompositeRef(category, key))
-                hasComposite = true;
-            else if (OverlayHelper.isInternal(category))
+            if (OverlayHelper.isInternal(category))
                 hasInternal = true;
-        }
-
-        if (hasComposite) {
-            // Use Datasets logic but ONLY over composite rows
-            applyAggregationFromDatasetsCompositeOnly(rows, kind, tableKey, calcCategory, calcKey);
-            return;
+            else if (OverlayHelper.isCompositeRef(category, key))
+                hasComposite = true;
         }
 
         if (hasInternal) {
-            // INTERNAL only -> always MAX (no Datasets noise)
+            // hard rule: INTERNAL => MAX
             persistAndApply(rows, kind, tableKey, calcCategory, calcKey, "MAX");
             return;
         }
 
-        // Neither internal nor composite rows -> quiet SUM
+        if (hasComposite) {
+            applyAggregationFromDatasetsCompositeOnly(rows, kind, tableKey, calcCategory, calcKey);
+            return;
+        }
+
+        // No internal, no composite -> quiet SUM
         persistAndApply(rows, kind, tableKey, calcCategory, calcKey, "SUM");
     }
 
@@ -285,7 +282,7 @@ public final class OverlayTierRunner implements Runnable {
 
             boolean composite = OverlayHelper.isCompositeRef(category, key);
             if (!composite)
-                continue; // ignore INTERNAL here entirely
+                continue; // INTERNAL ignored entirely here
 
             compositeCount++;
 
@@ -296,8 +293,7 @@ public final class OverlayTierRunner implements Runnable {
             }
 
             if (ds instanceof Number num) {
-                double v = num.doubleValue();
-                if (v != 0.0)
+                if (num.doubleValue() != 0.0)
                     sawNumeric = true;
                 continue;
             }
@@ -311,8 +307,7 @@ public final class OverlayTierRunner implements Runnable {
             String t = s.trim();
             if (!t.isEmpty() && t.matches("^-?\\d+(\\.\\d+)?$")) {
                 try {
-                    double v = Double.parseDouble(t);
-                    if (v != 0.0)
+                    if (Double.parseDouble(t) != 0.0)
                         sawNumeric = true;
                     continue;
                 } catch (Exception ignored) {
@@ -323,7 +318,6 @@ public final class OverlayTierRunner implements Runnable {
         }
 
         if (compositeCount == 0) {
-            // Fallback safety (shouldn't happen because caller checks hasComposite)
             persistAndApply(rows, kind, tableKey, calcCategory, calcKey, "SUM");
             return;
         }
@@ -371,7 +365,8 @@ public final class OverlayTierRunner implements Runnable {
                     kind, tableKey, op, t.getMessage());
         }
 
-        // Persist operation so DB mirrors the decision
+        // Persist chosen op in public.calculations — no info log, warnings only on
+        // error
         try {
             if (calcCategory == null || calcCategory.isBlank() || calcKey == null || calcKey.isBlank()) {
                 System.err.printf(java.util.Locale.ROOT,
@@ -380,8 +375,6 @@ public final class OverlayTierRunner implements Runnable {
                 return;
             }
             OverlayDBAccess.upsertCalculationOperation(calcCategory, calcKey, op);
-            System.out.printf(java.util.Locale.ROOT,
-                    "Overlay AGG: persisted op='%s' for (%s|%s)%n", op, calcCategory, calcKey);
         } catch (Throwable t) {
             System.err.printf(java.util.Locale.ROOT,
                     "Overlay AGG ERROR: persist op failed for (%s|%s -> %s): %s%n",

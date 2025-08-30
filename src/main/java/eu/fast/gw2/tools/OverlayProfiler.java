@@ -6,6 +6,9 @@ public final class OverlayProfiler {
     public long belowCutoff;
     public long fastComposite, fastItem;
 
+    /** Controls per-table progress lines; summaries still respect `enabled`. */
+    public static volatile boolean VERBOSE = false;
+
     // scratch
     private String tierName;
     private boolean enabled;
@@ -16,13 +19,12 @@ public final class OverlayProfiler {
     }
 
     public void tableBegin(String name, boolean isMain, int rowsCount, int index1Based, int totalCount) {
-        if (!enabled)
+        if (!enabled || !VERBOSE)
             return;
         System.out.println(String.format(
                 java.util.Locale.ROOT,
                 "[%d/%d] Overlay %s %s table='%s' rows=%d",
                 index1Based, totalCount, tierName, (isMain ? "MAIN" : "DETAIL"), name, rowsCount));
-
     }
 
     public void printSummary(String tierName) {
