@@ -2,6 +2,7 @@ package eu.fast.gw2.tools;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
@@ -79,7 +80,6 @@ public class OverlayCalc {
      * Taxes selection (deterministic):
      * - INTERNAL / NEGATIVE / UNCHECKED -> 0%
      * - Else prefer row calc (category|key), else table-level, else 15%
-     * (No more "composite ref => 0" special case)
      */
     public static int pickTaxesPercent(String category, String key, CalculationsDao.Config tableCfg) {
         if (category != null) {
@@ -119,22 +119,213 @@ public class OverlayCalc {
         }
     }
 
+    // =====================================================================
+    // Recursive EV with caller-controlled aggregation (SUM / MAX)
+    // =====================================================================
+
     /**
-     * Get EV for a detail key using LRU cache; ensures prices exist in priceMap.
+     * Back-compat overload: defaults to SUM aggregation for the referenced table.
      */
     public static int[] evForDetail(String refKey, Map<Integer, int[]> priceMap, int taxesPercent, String tierKey) {
+        return evForDetail(refKey, priceMap, taxesPercent, tierKey, "SUM");
+    }
+
+    /**
+     * Compute EV for a referenced detail table:
+     * - Walk its rows recursively (composites call back with their own
+     * Datasets-driven op).
+     * - Collapse THIS table's rows using the provided {@code aggOp}: "SUM" | "MAX".
+     * - Returns int[2] = { buyEV, sellEV }.
+     */
+    public static int[] evForDetail(String refKey,
+            Map<Integer, int[]> priceMap,
+            int taxesPercent,
+            String tierKey,
+            String aggOp) {
         if (refKey == null || refKey.isBlank())
             return new int[] { 0, 0 };
-        String ck = tierKey + "|" + taxesPercent + "|" + refKey;
+
+        final String op = (aggOp == null || aggOp.isBlank()) ? "SUM" : aggOp.trim().toUpperCase(java.util.Locale.ROOT);
+        String ck = tierKey + "|" + taxesPercent + "|" + op + "|" + refKey;
         int[] cached = OverlayCache.getEv(ck);
         if (cached != null)
             return cached;
 
-        var drops = OverlayCache.getDetailRowsCached(refKey);
-        ensurePricesForIds(priceMap, OverlayHelper.extractIds(drops), tierKey);
+        List<Map<String, Object>> rows = OverlayCache.getDetailRowsCached(refKey);
+        if (rows == null || rows.isEmpty()) {
+            int[] ev = new int[] { 0, 0 };
+            OverlayCache.putEv(ck, ev);
+            return ev;
+        }
 
-        int[] ev = OverlayHelper.bagEV(drops, priceMap, taxesPercent);
-        OverlayCache.putEv(ck, ev);
-        return ev;
+        // Ensure prices for the immediate leaf items in this table
+        ensurePricesForIds(priceMap, OverlayHelper.extractIds(rows), tierKey);
+
+        // Collect per-row EV pairs (already quantized by row's AverageAmount)
+        List<int[]> perRow = new ArrayList<>(rows.size());
+        for (Map<String, Object> r : rows) {
+            int[] pair = evalRowEVPair(r, priceMap, taxesPercent, tierKey);
+            if (pair != null)
+                perRow.add(pair);
+        }
+
+        // Aggregate this table's rows according to aggOp
+        int[] result = aggregatePairs(perRow, op);
+        OverlayCache.putEv(ck, result);
+        return result;
+    }
+
+    /** Compute one row's EV pair (buy,sell), including AverageAmount scaling. */
+    private static int[] evalRowEVPair(Map<String, Object> row,
+            Map<Integer, int[]> priceMap,
+            int parentTaxesPercent,
+            String tierKey) {
+        if (row == null)
+            return new int[] { 0, 0 };
+
+        String rawCategory = OverlayHelper.str(row.get(OverlayHelper.COL_CAT));
+        String rawKey = OverlayHelper.str(row.get(OverlayHelper.COL_KEY));
+        int itemId = OverlayHelper.toInt(row.get(OverlayHelper.COL_ID), -1);
+
+        // Skip UNCHECKED silently
+        if ("UNCHECKED".equalsIgnoreCase(rawCategory))
+            return new int[] { 0, 0 };
+
+        // NEGATIVE: untaxed negatives × qty
+        if ("NEGATIVE".equalsIgnoreCase(rawCategory)) {
+            double qty = OverlayHelper.toDouble(row.get(OverlayHelper.COL_AVG), 1.0);
+            int[] ps = (itemId > 0) ? priceMap.getOrDefault(itemId, new int[] { 0, 0 }) : new int[] { 0, 0 };
+            int unitBuy = (ps.length > 0 ? ps[0] : 0);
+            int unitSell = (ps.length > 1 ? ps[1] : 0);
+            int buy = (int) Math.round(-qty * unitBuy);
+            int sell = (int) Math.round(-qty * unitSell);
+            return new int[] { buy, sell };
+        }
+
+        // Determine effective taxes for THIS row
+        int taxesForRow;
+        String effectiveCategory;
+        String effectiveKey;
+
+        if ("INTERNAL".equalsIgnoreCase(rawCategory)) {
+            effectiveCategory = "INTERNAL";
+            effectiveKey = (rawKey == null ? "" : rawKey);
+            taxesForRow = 0; // internal always 0
+        } else if (rawCategory != null && !rawCategory.isBlank() && rawKey != null && !rawKey.isBlank()) {
+            effectiveCategory = rawCategory;
+            effectiveKey = rawKey;
+            taxesForRow = pickTaxesPercent(effectiveCategory, effectiveKey, null);
+        } else {
+            effectiveCategory = (rawCategory == null ? "" : rawCategory);
+            effectiveKey = (rawKey == null ? "" : rawKey);
+            taxesForRow = parentTaxesPercent;
+        }
+
+        // Composite ref?
+        boolean isComposite = (rawCategory != null && !rawCategory.isBlank() && rawKey != null && !rawKey.isBlank());
+        if (isComposite || "INTERNAL".equalsIgnoreCase(rawCategory)) {
+            // Datasets: "static" => MAX; number => SUM; unknown => SUM (warn)
+            String opForChild = deriveAggFromDatasets(row);
+            int[] child = evForDetail(rawKey, priceMap, taxesForRow, tierKey, opForChild);
+            int evBuy = (child.length > 0 ? child[0] : 0);
+            int evSell = (child.length > 1 ? child[1] : 0);
+
+            double qty = OverlayHelper.toDouble(row.get(OverlayHelper.COL_AVG), 1.0);
+            return new int[] {
+                    (int) Math.round(evBuy * qty),
+                    (int) Math.round(evSell * qty)
+            };
+        }
+
+        // Plain item (leaf)
+        if (itemId > 0) {
+            int[] ps = priceMap.getOrDefault(itemId, new int[] { 0, 0 });
+
+            int unitBuy = ps.length > 0 ? Math.max(0, ps[0]) : 0;
+            int unitSell = ps.length > 1 ? Math.max(0, ps[1]) : 0;
+
+            int buyNet = OverlayHelper.net(unitBuy, taxesForRow);
+            int sellNet = OverlayHelper.net(unitSell, taxesForRow);
+
+            if (buyNet == 0 && sellNet == 0) {
+                Integer vv = OverlayCache.vendorValueCached(itemId);
+                if (vv != null && vv > 0) {
+                    sellNet = vv;
+                }
+            }
+
+            double qty = OverlayHelper.toDouble(row.get(OverlayHelper.COL_AVG), 1.0);
+            return new int[] {
+                    (int) Math.round(buyNet * qty),
+                    (int) Math.round(sellNet * qty)
+            };
+        }
+
+        // Nothing to contribute
+        return new int[] { 0, 0 };
+    }
+
+    /**
+     * Map Datasets cell to an aggregation op for the referenced table.
+     * Rules:
+     * - "static" -> MAX
+     * - any number (Number instance or numeric string) -> SUM
+     * - missing/unknown -> SUM (warn)
+     */
+    private static String deriveAggFromDatasets(Map<String, Object> row) {
+        Object ds = row.get("Datasets");
+        if (ds == null) {
+            warnBadDatasets(row, "null");
+            return "SUM";
+        }
+
+        if (ds instanceof Number) {
+            return "SUM";
+        }
+
+        String s = String.valueOf(ds).trim();
+        if ("static".equalsIgnoreCase(s))
+            return "MAX";
+
+        if (!s.isEmpty() && s.matches("^-?\\d+(\\.\\d+)?$")) {
+            return "SUM";
+        }
+
+        warnBadDatasets(row, s);
+        return "SUM";
+    }
+
+    private static void warnBadDatasets(Map<String, Object> row, String val) {
+        String c = OverlayHelper.str(row.get(OverlayHelper.COL_CAT));
+        String k = OverlayHelper.str(row.get(OverlayHelper.COL_KEY));
+        String n = OverlayHelper.str(row.get(OverlayHelper.COL_NAME));
+        System.err.printf(java.util.Locale.ROOT,
+                "Overlay EV WARNING: composite row has unknown Datasets=%s (Category='%s' Key='%s' Name='%s'). Using SUM.%n",
+                String.valueOf(val), c, k, n);
+    }
+
+    /** Aggregate a list of {buy,sell} pairs with SUM or MAX. */
+    private static int[] aggregatePairs(List<int[]> pairs, String op) {
+        if (pairs == null || pairs.isEmpty())
+            return new int[] { 0, 0 };
+
+        long bSum = 0, sSum = 0;
+        int bMax = Integer.MIN_VALUE, sMax = Integer.MIN_VALUE;
+        for (int[] p : pairs) {
+            int b = (p == null || p.length < 1) ? 0 : p[0];
+            int s = (p == null || p.length < 2) ? 0 : p[1];
+            bSum += b;
+            sSum += s;
+            if (b > bMax)
+                bMax = b;
+            if (s > sMax)
+                sMax = s;
+        }
+
+        if ("MAX".equalsIgnoreCase(op)) {
+            return new int[] { Math.max(0, bMax), Math.max(0, sMax) };
+        }
+        // default SUM
+        return new int[] { (int) Math.min(bSum, Integer.MAX_VALUE), (int) Math.min(sSum, Integer.MAX_VALUE) };
     }
 }

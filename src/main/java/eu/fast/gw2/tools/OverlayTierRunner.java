@@ -1,3 +1,4 @@
+// REPLACE ENTIRE FILE: eu.fast.gw2.tools.OverlayTierRunner
 package eu.fast.gw2.tools;
 
 import java.util.Collections;
@@ -50,7 +51,7 @@ public final class OverlayTierRunner implements Runnable {
             Map<Integer, int[]> tierPrices = OverlayCache.getOrFillPriceCache(Collections.emptySet(), t);
             int warmed = 0, skipped = 0;
             for (String k : refKeys) {
-                String ck = t.label + "|0|" + k; // same cache key shape as evForDetail
+                String ck = t.label + "|0|SUM|" + k; // cache key shape with default SUM for warm
                 if (OverlayCache.getEv(ck) != null) {
                     skipped++;
                     continue;
@@ -91,7 +92,8 @@ public final class OverlayTierRunner implements Runnable {
         // -------- DETAIL --------
         long tierStart = System.currentTimeMillis();
         int ok = 0, fail = 0, skipped = 0, detailIndex = 0;
-        System.out.println("Overlay TIER " + t.name() + " DETAIL: start");
+        if (profile)
+            System.out.println("Overlay TIER " + t.name() + " DETAIL: start");
 
         Map<Integer, int[]> priceMap = OverlayCache.getOrFillPriceCache(Collections.emptySet(), t);
         for (Object[] row : detailTargets) {
@@ -123,10 +125,9 @@ public final class OverlayTierRunner implements Runnable {
                 for (int i = 0; i < rows.size(); i++)
                     OverlayRowComputer.computeRow(rows.get(i), ctx, i, prof, problems);
 
-                // ---- INTERNAL vs COMPOSITE:
-                // INTERNAL (in detail) must force MAX; only scan Datasets for COMPOSITE when
-                // there is no INTERNAL.
-                decideAndPersistOpCompositeOnly(rows, "detail", key, tableCategory, key);
+                // NOTE: No per-table Datasets scanning/persistence here.
+                // Keep detail TOTAL default as SUM (external manual overrides still allowed).
+                OverlayHelper.applyAggregation(rows, "SUM");
 
                 writer.enqueueDetail(fid, key, t.label, OverlayJson.toJson(rows));
                 ok++;
@@ -151,7 +152,8 @@ public final class OverlayTierRunner implements Runnable {
         tierStart = System.currentTimeMillis();
         ok = fail = 0;
         int mainIndex = 0;
-        System.out.println("Overlay TIER " + t.name() + " MAIN: start");
+        if (profile)
+            System.out.println("Overlay TIER " + t.name() + " MAIN: start");
 
         priceMap = OverlayCache.getOrFillPriceCache(Collections.emptySet(), t);
         for (String compositeKey : mainTargets) {
@@ -184,8 +186,8 @@ public final class OverlayTierRunner implements Runnable {
                 for (int i = 0; i < rows.size(); i++)
                     OverlayRowComputer.computeRow(rows.get(i), ctx, i, prof, problems);
 
-                // MAIN (INTERNAL): always MAX, no Datasets scanning
-                persistAndApply(rows, "main", compositeKey, "INTERNAL", aggKey, "MAX");
+                // MAIN (INTERNAL): policy = MAX
+                OverlayHelper.applyAggregation(rows, "MAX");
 
                 writer.enqueueMain(compositeKey, t.label, OverlayJson.toJson(rows));
                 ok++;
@@ -202,193 +204,5 @@ public final class OverlayTierRunner implements Runnable {
                 t.name(), tierMain / 1000.0);
 
         prof.printSummary(t.name());
-    }
-
-    // ========================================================================
-    // INTERNAL vs COMPOSITE op decision:
-    // - If table has ANY INTERNAL rows -> op = MAX (do NOT scan Datasets).
-    // - Else if table has COMPOSITE rows -> decide via Datasets over COMPOSITE rows
-    // only.
-    // - Else -> op = SUM (quiet default).
-    // ========================================================================
-    private static void decideAndPersistOpCompositeOnly(
-            List<Map<String, Object>> rows,
-            String kind,
-            String tableKey,
-            String calcCategory,
-            String calcKey) {
-
-        if (rows == null || rows.isEmpty()) {
-            // nothing to do
-            return;
-        }
-
-        boolean hasInternal = false;
-        boolean hasComposite = false;
-
-        for (Map<String, Object> r : rows) {
-            if (r == null)
-                continue;
-            String category = OverlayHelper.str(r.get(OverlayHelper.COL_CAT));
-            String key = OverlayHelper.str(r.get(OverlayHelper.COL_KEY));
-            if ("NEGATIVE".equalsIgnoreCase(category) || "UNCHECKED".equalsIgnoreCase(category))
-                continue;
-            if (OverlayHelper.isInternal(category))
-                hasInternal = true;
-            else if (OverlayHelper.isCompositeRef(category, key))
-                hasComposite = true;
-        }
-
-        if (hasInternal) {
-            // hard rule: INTERNAL => MAX
-            persistAndApply(rows, kind, tableKey, calcCategory, calcKey, "MAX");
-            return;
-        }
-
-        if (hasComposite) {
-            applyAggregationFromDatasetsCompositeOnly(rows, kind, tableKey, calcCategory, calcKey);
-            return;
-        }
-
-        // No internal, no composite -> quiet SUM
-        persistAndApply(rows, kind, tableKey, calcCategory, calcKey, "SUM");
-    }
-
-    // ========================================================================
-    // Datasets decision ONLY over COMPOSITE rows
-    // ========================================================================
-    private static void applyAggregationFromDatasetsCompositeOnly(
-            List<Map<String, Object>> rows,
-            String kind,
-            String tableKey,
-            String calcCategory,
-            String calcKey) {
-
-        boolean sawStatic = false;
-        boolean sawNumeric = false;
-        int unknownCount = 0;
-        StringBuilder unknownExamples = new StringBuilder();
-        int compositeCount = 0;
-
-        for (int i = 0; i < rows.size(); i++) {
-            Map<String, Object> r = rows.get(i);
-            if (r == null)
-                continue;
-
-            String category = OverlayHelper.str(r.get(OverlayHelper.COL_CAT));
-            String key = OverlayHelper.str(r.get(OverlayHelper.COL_KEY));
-            if ("NEGATIVE".equalsIgnoreCase(category) || "UNCHECKED".equalsIgnoreCase(category))
-                continue;
-
-            boolean composite = OverlayHelper.isCompositeRef(category, key);
-            if (!composite)
-                continue; // INTERNAL ignored entirely here
-
-            compositeCount++;
-
-            Object ds = r.get("Datasets");
-            if (ds == null) {
-                unknownCount += logUnknown(kind, tableKey, i, r, "null", unknownExamples);
-                continue;
-            }
-
-            if (ds instanceof Number num) {
-                if (num.doubleValue() != 0.0)
-                    sawNumeric = true;
-                continue;
-            }
-
-            String s = String.valueOf(ds);
-            if ("static".equals(s)) {
-                sawStatic = true;
-                continue;
-            }
-
-            String t = s.trim();
-            if (!t.isEmpty() && t.matches("^-?\\d+(\\.\\d+)?$")) {
-                try {
-                    if (Double.parseDouble(t) != 0.0)
-                        sawNumeric = true;
-                    continue;
-                } catch (Exception ignored) {
-                }
-            }
-
-            unknownCount += logUnknown(kind, tableKey, i, r, s, unknownExamples);
-        }
-
-        if (compositeCount == 0) {
-            persistAndApply(rows, kind, tableKey, calcCategory, calcKey, "SUM");
-            return;
-        }
-
-        if (unknownCount > 0) {
-            System.err.printf(java.util.Locale.ROOT,
-                    "Overlay AGG WARNING: %s '%s' has %d unknown/empty Datasets among COMPOSITE rows. Examples:%n%s",
-                    kind, tableKey, unknownCount, unknownExamples.toString());
-        }
-
-        String op;
-        if (sawStatic && sawNumeric) {
-            System.err.printf(java.util.Locale.ROOT,
-                    "Overlay AGG WARNING: %s '%s' has mixed Datasets on COMPOSITE rows (\"static\" + numbers). Using SUM.%n",
-                    kind, tableKey);
-            op = "SUM";
-        } else if (sawStatic) {
-            op = "MAX";
-        } else if (sawNumeric) {
-            op = "SUM";
-        } else {
-            System.err.printf(java.util.Locale.ROOT,
-                    "Overlay AGG WARNING: %s '%s' has no usable Datasets on COMPOSITE rows (need \"static\" or a number). Using SUM.%n",
-                    kind, tableKey);
-            op = "SUM";
-        }
-
-        persistAndApply(rows, kind, tableKey, calcCategory, calcKey, op);
-    }
-
-    private static void persistAndApply(
-            List<Map<String, Object>> rows,
-            String kind,
-            String tableKey,
-            String calcCategory,
-            String calcKey,
-            String op) {
-
-        // Apply to computed rows first (local effect for this overlay write)
-        try {
-            OverlayHelper.applyAggregation(rows, op);
-        } catch (Throwable t) {
-            System.err.printf(java.util.Locale.ROOT,
-                    "Overlay AGG ERROR: %s '%s' applyAggregation('%s') failed: %s%n",
-                    kind, tableKey, op, t.getMessage());
-        }
-
-        // Persist chosen op in public.calculations — no info log, warnings only on
-        // error
-        try {
-            if (calcCategory == null || calcCategory.isBlank() || calcKey == null || calcKey.isBlank()) {
-                System.err.printf(java.util.Locale.ROOT,
-                        "Overlay AGG WARNING: %s '%s' missing (category|key) for calculations upsert; op='%s' not persisted.%n",
-                        kind, tableKey, op);
-                return;
-            }
-            OverlayDBAccess.upsertCalculationOperation(calcCategory, calcKey, op);
-        } catch (Throwable t) {
-            System.err.printf(java.util.Locale.ROOT,
-                    "Overlay AGG ERROR: persist op failed for (%s|%s -> %s): %s%n",
-                    String.valueOf(calcCategory), String.valueOf(calcKey), op, t.getMessage());
-        }
-    }
-
-    private static int logUnknown(String kind, String tableKey, int rowIndex, Map<String, Object> r, String val,
-            StringBuilder sink) {
-        int id = OverlayHelper.toInt(r.get(OverlayHelper.COL_ID), -1);
-        String name = OverlayHelper.str(r.get(OverlayHelper.COL_NAME));
-        sink.append(String.format(java.util.Locale.ROOT,
-                "  - %s '%s' row=%d Id=%d Name=\"%s\" Datasets=%s%n",
-                kind, tableKey, rowIndex, id, name, String.valueOf(val)));
-        return 1;
     }
 }
