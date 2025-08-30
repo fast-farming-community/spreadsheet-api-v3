@@ -77,6 +77,28 @@ public class OverlayCalc {
     }
 
     /**
+     * Resolve aggregation op from public.calculations.operation with safe defaults.
+     * - INTERNAL -> MAX (hard rule)
+     * - If DB op is "MAX" -> MAX
+     * - If DB op is "SUM" (or blank/unknown) -> SUM
+     */
+    public static String pickAggregationOp(String category, String key) {
+        if ("INTERNAL".equalsIgnoreCase(category))
+            return "MAX";
+
+        CalculationsDao.Config cfg = getCalcCfg(category, key);
+        String op = (cfg == null) ? null : cfg.operation();
+        if (op != null) {
+            op = op.trim().toUpperCase(java.util.Locale.ROOT);
+            if ("MAX".equals(op))
+                return "MAX";
+            if ("SUM".equals(op))
+                return "SUM";
+        }
+        return "SUM";
+    }
+
+    /**
      * Taxes selection (deterministic):
      * - INTERNAL / NEGATIVE / UNCHECKED -> 0%
      * - Else prefer row calc (category|key), else table-level, else 15%
@@ -120,20 +142,17 @@ public class OverlayCalc {
     }
 
     // =====================================================================
-    // Recursive EV with caller-controlled aggregation (SUM / MAX)
+    // Recursive EV with caller-provided aggregation (SUM / MAX)
     // =====================================================================
 
-    /**
-     * Back-compat overload: defaults to SUM aggregation for the referenced table.
-     */
+    /** Back-compat overload: defaults to SUM aggregation. */
     public static int[] evForDetail(String refKey, Map<Integer, int[]> priceMap, int taxesPercent, String tierKey) {
         return evForDetail(refKey, priceMap, taxesPercent, tierKey, "SUM");
     }
 
     /**
      * Compute EV for a referenced detail table:
-     * - Walk its rows recursively (composites call back with their own
-     * Datasets-driven op).
+     * - Walk its rows recursively (composites call back using DB-seeded op).
      * - Collapse THIS table's rows using the provided {@code aggOp}: "SUM" | "MAX".
      * - Returns int[2] = { buyEV, sellEV }.
      */
@@ -224,9 +243,10 @@ public class OverlayCalc {
         // Composite ref?
         boolean isComposite = (rawCategory != null && !rawCategory.isBlank() && rawKey != null && !rawKey.isBlank());
         if (isComposite || "INTERNAL".equalsIgnoreCase(rawCategory)) {
-            // Datasets: "static" => MAX; number => SUM; unknown => SUM (warn)
-            String opForChild = deriveAggFromDatasets(row);
-            int[] child = evForDetail(rawKey, priceMap, taxesForRow, tierKey, opForChild);
+            // Use DB-seeded operation for the referenced table
+            String opForChild = pickAggregationOp(effectiveCategory, effectiveKey);
+
+            int[] child = evForDetail(effectiveKey, priceMap, taxesForRow, tierKey, opForChild);
             int evBuy = (child.length > 0 ? child[0] : 0);
             int evSell = (child.length > 1 ? child[1] : 0);
 
@@ -263,45 +283,6 @@ public class OverlayCalc {
 
         // Nothing to contribute
         return new int[] { 0, 0 };
-    }
-
-    /**
-     * Map Datasets cell to an aggregation op for the referenced table.
-     * Rules:
-     * - "static" -> MAX
-     * - any number (Number instance or numeric string) -> SUM
-     * - missing/unknown -> SUM (warn)
-     */
-    private static String deriveAggFromDatasets(Map<String, Object> row) {
-        Object ds = row.get("Datasets");
-        if (ds == null) {
-            warnBadDatasets(row, "null");
-            return "SUM";
-        }
-
-        if (ds instanceof Number) {
-            return "SUM";
-        }
-
-        String s = String.valueOf(ds).trim();
-        if ("static".equalsIgnoreCase(s))
-            return "MAX";
-
-        if (!s.isEmpty() && s.matches("^-?\\d+(\\.\\d+)?$")) {
-            return "SUM";
-        }
-
-        warnBadDatasets(row, s);
-        return "SUM";
-    }
-
-    private static void warnBadDatasets(Map<String, Object> row, String val) {
-        String c = OverlayHelper.str(row.get(OverlayHelper.COL_CAT));
-        String k = OverlayHelper.str(row.get(OverlayHelper.COL_KEY));
-        String n = OverlayHelper.str(row.get(OverlayHelper.COL_NAME));
-        System.err.printf(java.util.Locale.ROOT,
-                "Overlay EV WARNING: composite row has unknown Datasets=%s (Category='%s' Key='%s' Name='%s'). Using SUM.%n",
-                String.valueOf(val), c, k, n);
     }
 
     /** Aggregate a list of {buy,sell} pairs with SUM or MAX. */

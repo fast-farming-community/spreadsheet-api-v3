@@ -1,4 +1,3 @@
-// REPLACE ENTIRE FILE: eu.fast.gw2.tools.OverlayRowComputer
 package eu.fast.gw2.tools;
 
 import java.util.ArrayList;
@@ -125,13 +124,15 @@ public final class OverlayRowComputer {
         // Taxes now based on resolved (category,key)
         int taxesPct = OverlayCalc.pickTaxesPercent(effCategory, effKey, ctx.tableConfig);
 
-        // INTERNAL composite (MAIN) or general composite ref: EV path with per-row
-        // Datasets->op
+        // INTERNAL composite (MAIN) or general composite ref: EV path using seeded
+        // operation
         boolean isCompositeRef = (effKey != null && !effKey.isBlank()
                 && ("INTERNAL".equalsIgnoreCase(effCategory) || !OverlayHelper.isInternal(effCategory)));
 
         if (isCompositeRef) {
-            String op = deriveAggFromDatasets(row);
+            // Pull op from public.calculations (seeded); INTERNAL always MAX by rule.
+            String op = OverlayCalc.pickAggregationOp(effCategory, effKey);
+
             int[] ev = OverlayCalc.evForDetail(effKey, ctx.priceByItemId, taxesPct, ctx.tier.columnKey(), op);
             int evBuy = (ev != null && ev.length > 0) ? ev[0] : 0;
             int evSell = (ev != null && ev.length > 1) ? ev[1] : 0;
@@ -323,44 +324,5 @@ public final class OverlayRowComputer {
             row.put(OverlayHelper.COL_ITEM_BUY_TPSELL_WSS_HR,
                     (hours > 0.0) ? (int) Math.floor(IB_TPS_wSS / hours) : IB_TPS_wSS);
         }
-    }
-
-    /**
-     * Map Datasets cell to an aggregation op for the referenced table.
-     * Rules:
-     * - "static" -> MAX
-     * - any number (Number instance or numeric string) -> SUM
-     * - missing/unknown -> SUM (warn)
-     */
-    private static String deriveAggFromDatasets(Map<String, Object> row) {
-        Object ds = row.get("Datasets");
-        if (ds == null) {
-            warnBadDatasets(row, "null");
-            return "SUM";
-        }
-
-        if (ds instanceof Number) {
-            return "SUM";
-        }
-
-        String s = String.valueOf(ds).trim();
-        if ("static".equalsIgnoreCase(s))
-            return "MAX";
-
-        if (!s.isEmpty() && s.matches("^-?\\d+(\\.\\d+)?$")) {
-            return "SUM";
-        }
-
-        warnBadDatasets(row, s);
-        return "SUM";
-    }
-
-    private static void warnBadDatasets(Map<String, Object> row, String val) {
-        String c = OverlayHelper.str(row.get(OverlayHelper.COL_CAT));
-        String k = OverlayHelper.str(row.get(OverlayHelper.COL_KEY));
-        String n = OverlayHelper.str(row.get(OverlayHelper.COL_NAME));
-        System.err.printf(java.util.Locale.ROOT,
-                "Overlay EV WARNING: composite row has unknown Datasets=%s (Category='%s' Key='%s' Name='%s'). Using SUM.%n",
-                String.valueOf(val), c, k, n);
     }
 }
