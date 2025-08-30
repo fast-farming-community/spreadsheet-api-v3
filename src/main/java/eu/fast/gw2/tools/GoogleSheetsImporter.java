@@ -145,8 +145,7 @@ public class GoogleSheetsImporter implements AutoCloseable {
 
         var chunks = partition(names, RANGES_CHUNK_SIZE);
 
-        int threads = Math.min(THREADS, Math.max(1, Runtime.getRuntime().availableProcessors() / 2));
-        this.pool = Executors.newFixedThreadPool(threads);
+        this.pool = Executors.newFixedThreadPool(THREADS);
 
         final AtomicInteger startedRanges = new AtomicInteger(0);
 
