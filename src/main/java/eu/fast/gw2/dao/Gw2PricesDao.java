@@ -28,13 +28,13 @@ public class Gw2PricesDao {
 
         final String buyCol, sellCol;
         switch (tierKey) {
-            case "5m" -> {
-                buyCol = "buy_5m";
-                sellCol = "sell_5m";
+            case "2m" -> {
+                buyCol = "buy_2m";
+                sellCol = "sell_2m";
             }
-            case "15m" -> {
-                buyCol = "buy_15m";
-                sellCol = "sell_15m";
+            case "10m" -> {
+                buyCol = "buy_10m";
+                sellCol = "sell_10m";
             }
             default -> {
                 buyCol = "buy_60m";

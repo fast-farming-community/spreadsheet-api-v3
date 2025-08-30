@@ -5,8 +5,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import eu.fast.gw2.tools.Jpa;
 
 public class RunService {
-    // default: 5 minutes (override with -Dservice.period.ms=300000)
-    private static final long PERIOD_MS = Long.getLong("service.period.ms", 5 * 60_000L);
+    // default: 2 minutes (override with -Dservice.period.ms=300000)
+    private static final long PERIOD_MS = Long.getLong("service.period.ms", 2 * 60_000L);
     private static final AtomicBoolean running = new AtomicBoolean(false);
     private static volatile boolean stop = false;
 

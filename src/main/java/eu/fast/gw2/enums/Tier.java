@@ -1,8 +1,8 @@
 package eu.fast.gw2.enums;
 
 public enum Tier {
-    T5M("5m", "buy_5m", "sell_5m", "ts_5m"),
-    T15M("15m", "buy_15m", "sell_15m", "ts_15m"),
+    T2M("2m", "buy_2m", "sell_2m", "ts_2m"),
+    T10M("10m", "buy_10m", "sell_10m", "ts_10m"),
     T60M("60m", "buy_60m", "sell_60m", "ts_60m");
 
     public final String label;
@@ -21,10 +21,10 @@ public enum Tier {
         if (s == null)
             return T60M;
         switch (s.trim().toLowerCase()) {
-            case "5m":
-                return T5M;
-            case "15m":
-                return T15M;
+            case "2m":
+                return T2M;
+            case "10m":
+                return T10M;
             case "60m":
             default:
                 return T60M;
@@ -33,8 +33,8 @@ public enum Tier {
 
     public String columnKey() {
         return switch (this) {
-            case T5M -> "5m";
-            case T15M -> "15m";
+            case T2M -> "2m";
+            case T10M -> "10m";
             case T60M -> "60m";
         };
     }

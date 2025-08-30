@@ -75,15 +75,15 @@ public class TierPricesDao {
 
     /**
      * One-shot multi-tier upsert.
-     * - Always writes 5m (buy/sell + ts_5m=now()).
-     * - Writes 15m/60m only when the ID is in the respective due set (else
+     * - Always writes 2m (buy/sell + ts_2m=now()).
+     * - Writes 10m/60m only when the ID is in the respective due set (else
      * leaves columns as-is).
      * - Writes activity_last/activity_ts for all rows.
      * 
      * @return number of rows inserted/updated (size of input map).
      */
     public static int upsertMulti(Map<Integer, int[]> prices,
-            Set<Integer> due15,
+            Set<Integer> due10,
             Set<Integer> due60,
             Map<Integer, Integer> activity) {
 
@@ -95,8 +95,8 @@ public class TierPricesDao {
         sb.append("""
                     INSERT INTO public.gw2_prices_tiers (
                         item_id,
-                        buy_5m,  sell_5m,  ts_5m,
-                        buy_15m, sell_15m, ts_15m,
+                        buy_2m,  sell_2m,  ts_2m,
+                        buy_10m, sell_10m, ts_10m,
                         buy_60m, sell_60m, ts_60m,
                         activity_last, activity_ts, updated_at
                     ) VALUES
@@ -109,7 +109,7 @@ public class TierPricesDao {
             int sell = (e.getValue() != null && e.getValue().length > 1) ? e.getValue()[1] : 0;
             int act = (activity != null && activity.containsKey(id)) ? activity.get(id) : 0;
 
-            boolean d15 = due15 != null && due15.contains(id);
+            boolean d10 = due10 != null && due10.contains(id);
             boolean d60 = due60 != null && due60.contains(id);
 
             if (!first)
@@ -117,12 +117,12 @@ public class TierPricesDao {
             first = false;
 
             sb.append('(').append(id).append(',')
-                    // 5m always
+                    // 2m always
                     .append(buy).append(',').append(sell).append(", now(),")
-                    // 15m conditional
-                    .append(d15 ? String.valueOf(buy) : "NULL").append(',')
-                    .append(d15 ? String.valueOf(sell) : "NULL").append(',')
-                    .append(d15 ? "now()" : "NULL").append(',')
+                    // 10m conditional
+                    .append(d10 ? String.valueOf(buy) : "NULL").append(',')
+                    .append(d10 ? String.valueOf(sell) : "NULL").append(',')
+                    .append(d10 ? "now()" : "NULL").append(',')
                     // 60m conditional
                     .append(d60 ? String.valueOf(buy) : "NULL").append(',')
                     .append(d60 ? String.valueOf(sell) : "NULL").append(',')
@@ -133,15 +133,15 @@ public class TierPricesDao {
 
         sb.append("""
                     ON CONFLICT (item_id) DO UPDATE SET
-                      -- 5m always refresh
-                      buy_5m  = EXCLUDED.buy_5m,
-                      sell_5m = EXCLUDED.sell_5m,
-                      ts_5m   = EXCLUDED.ts_5m,
+                      -- 2m always refresh
+                      buy_2m  = EXCLUDED.buy_2m,
+                      sell_2m = EXCLUDED.sell_2m,
+                      ts_2m   = EXCLUDED.ts_2m,
 
-                      -- 15m/60m only when provided (EXCLUDED is non-null)
-                      buy_15m  = COALESCE(EXCLUDED.buy_15m,  gw2_prices_tiers.buy_15m),
-                      sell_15m = COALESCE(EXCLUDED.sell_15m, gw2_prices_tiers.sell_15m),
-                      ts_15m   = COALESCE(EXCLUDED.ts_15m,   gw2_prices_tiers.ts_15m),
+                      -- 10m/60m only when provided (EXCLUDED is non-null)
+                      buy_10m  = COALESCE(EXCLUDED.buy_10m,  gw2_prices_tiers.buy_10m),
+                      sell_10m = COALESCE(EXCLUDED.sell_10m, gw2_prices_tiers.sell_10m),
+                      ts_10m   = COALESCE(EXCLUDED.ts_10m,   gw2_prices_tiers.ts_10m),
 
                       buy_60m  = COALESCE(EXCLUDED.buy_60m,  gw2_prices_tiers.buy_60m),
                       sell_60m = COALESCE(EXCLUDED.sell_60m, gw2_prices_tiers.sell_60m),

@@ -17,7 +17,7 @@ public class RefreshTierPrices {
     private static final int BATCH = 200;
 
     /** Execution summary for logging/metrics. */
-    public record Summary(int picked, int updated5m, int updated15m, int updated60m, int vendorUpdated) {
+    public record Summary(int picked, int updated2m, int updated10m, int updated60m, int vendorUpdated) {
     }
 
     /** Refactored runner (no main). */
@@ -40,7 +40,7 @@ public class RefreshTierPrices {
         int total = candidates.size();
         int batches = (total + BATCH - 1) / BATCH;
 
-        int total5m = 0, total15m = 0, total60m = 0, totalVendorUpdated = 0;
+        int total2m = 0, total10m = 0, total60m = 0, totalVendorUpdated = 0;
 
         for (int bi = 0; bi < batches; bi++) {
             int off = bi * BATCH;
@@ -49,7 +49,7 @@ public class RefreshTierPrices {
 
             // Single pass over rows: collect everything with minimal allocations
             List<Integer> ids = new ArrayList<>(rows.size());
-            Set<Integer> due15 = new HashSet<>();
+            Set<Integer> due10 = new HashSet<>();
             Set<Integer> due60 = new HashSet<>();
             Set<Integer> vendorMissing = new HashSet<>();
             Set<Integer> needItemsIds = new HashSet<>();
@@ -61,8 +61,8 @@ public class RefreshTierPrices {
                 DueRow r = rows.get(i);
                 int id = r.id();
                 ids.add(id);
-                if (r.due15())
-                    due15.add(id);
+                if (r.due10())
+                    due10.add(id);
                 if (r.due60())
                     due60.add(id);
                 if (r.vendorMissing()) {
@@ -131,10 +131,10 @@ public class RefreshTierPrices {
 
             try {
                 // Upsert tier prices
-                TierPricesDao.upsertMulti(normalized, due15, due60, activity);
+                TierPricesDao.upsertMulti(normalized, due10, due60, activity);
 
-                total5m += normalized.size();
-                total15m += due15.size();
+                total2m += normalized.size();
+                total10m += due10.size();
                 total60m += due60.size();
 
                 // Vendor values (only for ones that were missing)
@@ -178,8 +178,8 @@ public class RefreshTierPrices {
 
             // --- concise batch line only ---
             System.out.printf(Locale.ROOT,
-                    "  [%d/%d] batch done: 5m=%d, 15m+=%d, 60m+=%d%n",
-                    end, total, normalized.size(), due15.size(), due60.size());
+                    "  [%d/%d] batch done: 2m=%d, 10m+=%d, 60m+=%d%n",
+                    end, total, normalized.size(), due10.size(), due60.size());
 
             if (end < total && sleepMs > 0) {
                 try {
@@ -192,19 +192,19 @@ public class RefreshTierPrices {
 
         System.out.println(String.format(
                 Locale.ROOT,
-                "Updated RefreshTierPrices: 5m=%d, 15m=%d, 60m=%d, vendor=%d (%.1fs)",
-                total5m, total15m, total60m, totalVendorUpdated,
+                "Updated RefreshTierPrices: 2m=%d, 10m=%d, 60m=%d, vendor=%d (%.1fs)",
+                total2m, total10m, total60m, totalVendorUpdated,
                 (System.currentTimeMillis() - runStart) / 1000.0));
 
-        return new Summary(total, total5m, total15m, total60m, totalVendorUpdated);
+        return new Summary(total, total2m, total10m, total60m, totalVendorUpdated);
     }
 
     /**
-     * one-shot candidate picker with due flags for 15/60 + vendor/image/rarity
+     * one-shot candidate picker with due flags for 10/60 + vendor/image/rarity
      * missing
      */
     private static List<DueRow> pickDueCandidates(Integer overallCap) {
-        final int fastMin = 5, slowMin = 60;
+        final int fastMin = 2, slowMin = 60;
         final int activityThreshold = Integer.parseInt(
                 Optional.ofNullable(System.getenv("GW2_LISTINGS_THRESHOLD")).orElse("5000"));
 
@@ -212,7 +212,7 @@ public class RefreshTierPrices {
             String sql = """
                     WITH candidates AS (
                       SELECT i.id,
-                             t.ts_5m, t.ts_15m, t.ts_60m,
+                             t.ts_2m, t.ts_10m, t.ts_60m,
                              COALESCE(t.activity_last, 0) AS activity,
                              gp.vendor_value, gp.image, gp.rarity
                       FROM public.items i
@@ -221,7 +221,7 @@ public class RefreshTierPrices {
                       WHERE i.tradable = true
                     )
                     SELECT id,
-                           (ts_15m IS NULL OR ts_15m < now() - make_interval(mins := 15)) AS due15,
+                           (ts_10m IS NULL OR ts_10m < now() - make_interval(mins := 10)) AS due10,
                            (ts_60m IS NULL OR ts_60m < now() - make_interval(mins := 60)) AS due60,
                            (vendor_value IS NULL) AS vendorMissing,
                            (image IS NULL) AS imageMissing,
@@ -231,19 +231,19 @@ public class RefreshTierPrices {
                       vendor_value IS NULL
                       OR image IS NULL
                       OR rarity IS NULL
-                      OR ts_5m IS NULL
-                      OR ts_5m < now() - (
+                      OR ts_2m IS NULL
+                      OR ts_2m < now() - (
                             CASE WHEN activity >= :thr
                                  THEN make_interval(mins := :fast)
                                  ELSE make_interval(mins := :slow)
                             END
                       )
-                      OR ts_15m IS NULL OR ts_15m < now() - make_interval(mins := 15)
+                      OR ts_10m IS NULL OR ts_10m < now() - make_interval(mins := 10)
                       OR ts_60m IS NULL OR ts_60m < now() - make_interval(mins := 60)
                     ORDER BY
                       LEAST(
-                        COALESCE(ts_5m,  TIMESTAMP 'epoch'),
-                        COALESCE(ts_15m, TIMESTAMP 'epoch'),
+                        COALESCE(ts_2m,  TIMESTAMP 'epoch'),
+                        COALESCE(ts_10m, TIMESTAMP 'epoch'),
                         COALESCE(ts_60m, TIMESTAMP 'epoch')
                       ) ASC, id ASC
                     %s
@@ -306,7 +306,7 @@ public class RefreshTierPrices {
     }
 
     // --- helper holder
-    private record DueRow(int id, boolean due15, boolean due60, boolean vendorMissing, boolean imageMissing,
+    private record DueRow(int id, boolean due10, boolean due60, boolean vendorMissing, boolean imageMissing,
             boolean rarityMissing) {
     }
 }

@@ -13,7 +13,7 @@ public class OverlayEngine {
         final long runStartMs = System.currentTimeMillis();
         final boolean PROFILE = true;
         final int TIER_THREADS = 3;
-        final Tier[] TIERS = { Tier.T5M, Tier.T15M, Tier.T60M };
+        final Tier[] TIERS = { Tier.T2M, Tier.T10M, Tier.T60M };
 
         OverlayProblemLog problems = new OverlayProblemLog();
 
