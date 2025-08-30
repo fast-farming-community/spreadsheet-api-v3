@@ -40,7 +40,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
  * - JSON is used only for reporting; DB structure drives seeding.
  * - No pruning of calculations here.
  */
-public class SeedCalculationsFromDetailTable {
+public class SeedCalculations {
 
     private static final String COL_CAT = "Category";
     private static final String COL_KEY = "Key";

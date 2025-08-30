@@ -14,6 +14,7 @@ import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.Pattern;
 
@@ -32,7 +33,7 @@ import com.google.api.services.sheets.v4.model.ValueRange;
 import com.google.auth.http.HttpCredentialsAdapter;
 import com.google.auth.oauth2.GoogleCredentials;
 
-public class GoogleSheetsImporter {
+public class GoogleSheetsImporter implements AutoCloseable {
 
     private static final ObjectMapper M = new ObjectMapper();
     private final Sheets sheets;
@@ -53,6 +54,15 @@ public class GoogleSheetsImporter {
     // Precompiled patterns to avoid re-compilation on hot paths
     private static final Pattern NON_ALNUM = Pattern.compile("[^A-Za-z0-9]");
     private static final Pattern TRAILING_NUM_SUFFIX = Pattern.compile("_(\\d+)$");
+
+    // ---------- new concurrency state ----------
+    private ExecutorService pool;
+    private final List<Future<?>> futures = new ArrayList<>();
+    private final AtomicInteger updDetail = new AtomicInteger(0);
+    private final AtomicInteger updMain = new AtomicInteger(0);
+    private final AtomicInteger insMain = new AtomicInteger(0);
+    private final AtomicInteger skipped = new AtomicInteger(0);
+    private volatile boolean started = false;
 
     public GoogleSheetsImporter(String spreadsheetId) throws Exception {
         this.spreadsheetId = spreadsheetId;
@@ -92,36 +102,42 @@ public class GoogleSheetsImporter {
                 withTimeoutsAndBackoff).setApplicationName("fast-gw2").build();
     }
 
-    /** Import only ranges present in DB (detail_tables + tables). */
+    /**
+     * Import only ranges present in DB (detail_tables + tables). Submits work and
+     * returns immediately.
+     */
     public void runFullImport() throws Exception {
+        if (started) {
+            System.out.println("GoogleSheetsImporter: runFullImport() already started; ignoring duplicate call.");
+            return;
+        }
+        started = true;
+
         List<String> names = loadRangesFromDb();
         if (names.isEmpty()) {
             System.out.println("No ranges in DB (public.detail_tables / public.tables). Nothing to import.");
             return;
         }
 
-        // Self-heal: drop DB rows that point to missing *named ranges* in Sheets
-        // (We only treat entries without '!' as named ranges; A1 ranges are left
-        // alone.)
+        // Self-heal: drop DB rows that point to missing named ranges
         Set<String> existingNamedRanges = listNamedRanges();
         List<String> missingNamed = names.stream()
                 .filter(n -> n != null && !n.isBlank())
-                .filter(n -> !n.contains("!")) // looks like a NamedRange, not A1
-                .filter(n -> !existingNamedRanges.contains(n)) // not present in the sheet anymore
+                .filter(n -> !n.contains("!"))
+                .filter(n -> !existingNamedRanges.contains(n))
                 .toList();
 
         if (!missingNamed.isEmpty()) {
             int removed = deleteRangesInDb(missingNamed);
             System.out.printf(Locale.ROOT,
                     "Pruned %d DB rows for missing named ranges: %s%n", removed, missingNamed);
-            // filter them out from this run to avoid API 400
             names = names.stream().filter(n -> !missingNamed.contains(n)).toList();
         }
 
         final int totalRanges = names.size();
         System.out.printf(Locale.ROOT, "Starting Sheets import: %d ranges in DB%n", totalRanges);
 
-        // Optionally group by sheet (ranges like "SheetName!A1:B5")
+        // sort/group
         names = names.stream()
                 .filter(this::looksReasonable)
                 .sorted((a, b) -> sheetOf(a).compareTo(sheetOf(b)))
@@ -130,13 +146,10 @@ public class GoogleSheetsImporter {
         var chunks = partition(names, RANGES_CHUNK_SIZE);
 
         int threads = Math.min(THREADS, Math.max(1, Runtime.getRuntime().availableProcessors() / 2));
-        ExecutorService pool = Executors.newFixedThreadPool(threads);
-
-        // Shared counters
-        final int[] updDetail = { 0 }, updMain = { 0 }, insMain = { 0 }, skipped = { 0 };
+        this.pool = Executors.newFixedThreadPool(threads);
 
         final AtomicInteger startedRanges = new AtomicInteger(0);
-        List<Future<?>> futures = new ArrayList<>();
+
         for (int ci = 0; ci < chunks.size(); ci++) {
             final int chunkIndex = ci;
             final List<String> chunk = chunks.get(ci);
@@ -173,26 +186,25 @@ public class GoogleSheetsImporter {
 
                     if (vr == null) {
                         System.err.println("   ! Range not returned: " + namedRange);
-                        increment(skipped);
+                        skipped.incrementAndGet();
                         continue;
                     }
 
                     List<List<Object>> grid = (vr.getValues() == null) ? List.of() : vr.getValues();
                     if (grid.isEmpty()) {
                         System.err.println("   ! Range has no values: " + namedRange);
-                        increment(skipped);
+                        skipped.incrementAndGet();
                         continue;
                     }
 
                     List<Object> headerRow = grid.get(0);
                     if (headerRow == null || headerRow.isEmpty()) {
                         System.err.println("   ! Header row empty: " + namedRange);
-                        increment(skipped);
+                        skipped.incrementAndGet();
                         continue;
                     }
 
-                    // Build normalized headers in a single pass; duplicates allowed (last-wins per
-                    // row)
+                    // headers
                     final int hdrSize = headerRow.size();
                     List<String> headers = new ArrayList<>(hdrSize);
                     for (int k = 0; k < hdrSize; k++) {
@@ -215,7 +227,6 @@ public class GoogleSheetsImporter {
                             if (v == null)
                                 continue;
 
-                            // compute base once and reuse for detection + parsing
                             String base = baseHeader(h);
 
                             // SPECIAL CASE: Duration / Notes as Google day fraction -> hh:mm:ss
@@ -242,27 +253,36 @@ public class GoogleSheetsImporter {
                         json = M.writeValueAsString(shaped);
                     } catch (Exception e) {
                         System.err.println("   ! JSON encode failed for " + namedRange + ": " + e.getMessage());
-                        increment(skipped);
+                        skipped.incrementAndGet();
                         continue;
                     }
 
                     int nDetail = updateDetailByRange(namedRange, json);
                     if (nDetail > 0) {
-                        add(updDetail, nDetail);
+                        updDetail.addAndGet(nDetail);
                         continue;
                     }
 
                     int nMain = updateMainByRange(namedRange, json);
                     if (nMain > 0) {
-                        add(updMain, nMain);
+                        updMain.addAndGet(nMain);
                         continue;
                     }
-                    increment(insMain);
+                    insMain.incrementAndGet();
                 }
             }));
         }
+        // NOTE: do NOT wait/print here. The caller will call awaitCompletion().
+    }
 
-        // wait for all
+    /** Block until all submitted chunks finished, then print the final summary. */
+    public void awaitCompletion() {
+        // Fast path: nothing was started
+        if (!started) {
+            return;
+        }
+
+        // Wait on task futures
         for (Future<?> f : futures) {
             try {
                 f.get();
@@ -270,27 +290,39 @@ public class GoogleSheetsImporter {
                 System.err.println("Worker failed: " + e.getMessage());
             }
         }
-        pool.shutdown();
 
+        // Shut down the pool cleanly
+        if (pool != null) {
+            pool.shutdown();
+            try {
+                if (!pool.awaitTermination(60, TimeUnit.SECONDS)) {
+                    pool.shutdownNow();
+                }
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                pool.shutdownNow();
+            }
+        }
+
+        // Final summary
         System.out.printf(Locale.ROOT,
                 "Sheets import done: detail=%d | main=%d | inserted=%d | skipped=%d%n",
-                updDetail[0], updMain[0], insMain[0], skipped[0]);
+                updDetail.get(), updMain.get(), insMain.get(), skipped.get());
+    }
+
+    @Override
+    public void close() {
+        // Safety valve: make sure we don't leak a pool if caller forgets to await.
+        if (pool != null && !pool.isShutdown()) {
+            pool.shutdownNow();
+        }
     }
 
     // TEMP: mimic legacy header normalization (strip non-alphanumerics).
-    // Remove when both sides accept dots/spaces and you migrate prod.
     private static String normalizeHeader(String h) {
         if (h == null)
             return "";
-        return NON_ALNUM.matcher(h.trim()).replaceAll(""); // removes spaces, dots, etc.
-    }
-
-    private static synchronized void increment(int[] box) {
-        box[0]++;
-    }
-
-    private static synchronized void add(int[] box, int n) {
-        box[0] += n;
+        return NON_ALNUM.matcher(h.trim()).replaceAll("");
     }
 
     private static String sheetOf(String a1) {
@@ -347,7 +379,6 @@ public class GoogleSheetsImporter {
 
     private static Number tryParseNumber(Object v, String header) {
         if (v instanceof Number n) {
-            // Special case: Id should never be decimal
             if ("Id".equalsIgnoreCase(header)) {
                 return n.longValue();
             }
@@ -358,7 +389,6 @@ public class GoogleSheetsImporter {
             if (s.isEmpty())
                 return null;
 
-            // If header is Id, force integer
             if ("Id".equalsIgnoreCase(header)) {
                 double d = Double.parseDouble(s);
                 return (long) d;
@@ -428,7 +458,7 @@ public class GoogleSheetsImporter {
     }
 
     private static String dayFractionToHms(double df) {
-        long totalSeconds = Math.round(df * 86400.0); // 24*60*60
+        long totalSeconds = Math.round(df * 86400.0);
         long h = totalSeconds / 3600;
         long m = (totalSeconds % 3600) / 60;
         long s = (totalSeconds % 60);
@@ -450,8 +480,7 @@ public class GoogleSheetsImporter {
         return names;
     }
 
-    // Remove rows whose "range" matches any of the given values (from both
-    // detail_tables and tables)
+    // Remove rows whose "range" matches any of the given values (from both tables)
     private int deleteRangesInDb(java.util.Collection<String> ranges) {
         if (ranges == null || ranges.isEmpty())
             return 0;
@@ -468,5 +497,4 @@ public class GoogleSheetsImporter {
             return sum;
         });
     }
-
 }

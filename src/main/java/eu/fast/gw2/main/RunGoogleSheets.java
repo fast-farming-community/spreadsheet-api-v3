@@ -1,7 +1,7 @@
 package eu.fast.gw2.main;
 
 import eu.fast.gw2.tools.GoogleSheetsImporter;
-import eu.fast.gw2.tools.SeedCalculationsFromDetailTable;
+import eu.fast.gw2.tools.SeedCalculations;
 
 public class RunGoogleSheets {
 
@@ -9,16 +9,15 @@ public class RunGoogleSheets {
 
     public static void main(String[] args) throws Exception {
         // 1) Import Google Sheets → upsert into public.tables/detail_tables
-        try {
-            GoogleSheetsImporter importer = new GoogleSheetsImporter(SHEET_ID);
+        try (GoogleSheetsImporter importer = new GoogleSheetsImporter(SHEET_ID)) {
             importer.runFullImport();
+            importer.awaitCompletion();
         } catch (Exception e) {
             System.err.println("! GoogleSheets import failed: " + e.getMessage());
+            return;
         }
 
-        // 2) Seed
-        SeedCalculationsFromDetailTable.run();
-
-        System.out.println("RunGoogleSheets: import + seed complete.");
+        // 2) Seed AFTER importer finished
+        SeedCalculations.run();
     }
 }
