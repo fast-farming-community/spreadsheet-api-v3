@@ -124,8 +124,19 @@ public final class OverlayRowComputer {
         // Taxes now based on resolved (category,key)
         int taxesPct = OverlayCalc.pickTaxesPercent(effCategory, effKey, ctx.tableConfig);
 
-        // INTERNAL composite (MAIN) or general composite ref: EV path using seeded
-        // operation
+        // LEAF/meta rows (both category and key blank) -> zero out without logging
+        if ((effCategory == null || effCategory.isBlank()) && (effKey == null || effKey.isBlank())) {
+            if (ctx.isMain)
+                OverlayHelper.writeFourWithHour(row, 0, 0, 0, 0);
+            else
+                OverlayHelper.writeFour(row, 0, 0, 0, 0);
+            writeSpiritShardAugments(row, ctx);
+            if (prof != null)
+                prof.fastItem++;
+            return;
+        }
+
+        // INTERNAL composite (MAIN) or general composite ref: EV path using seeded operation
         boolean isCompositeRef = (effKey != null && !effKey.isBlank()
                 && ("INTERNAL".equalsIgnoreCase(effCategory) || !OverlayHelper.isInternal(effCategory)));
 
