@@ -8,11 +8,11 @@ import eu.fast.gw2.tools.Jpa;
 
 public class CalculationsDao {
 
-    public record Config(String category,
+    public record Config(
+            String category,
             String key,
             String operation,
             int taxes,
-            String sourceTableKey,
             String formulasJson) {
     }
 
@@ -24,7 +24,6 @@ public class CalculationsDao {
                              key,
                              operation,
                              taxes,
-                             source_table_key,
                              formulas_json
                         FROM public.calculations
                        WHERE category = :c
@@ -56,9 +55,8 @@ public class CalculationsDao {
                     (String) a[0], // category
                     (String) a[1], // key
                     (String) a[2], // operation
-                    taxes,
-                    (String) a[4], // source_table_key
-                    (String) a[5] // formulas_json
+                    taxes, // taxes
+                    (String) a[4] // formulas_json
             );
         });
     }
@@ -66,20 +64,19 @@ public class CalculationsDao {
     /** Bulk-load latest row per (category,key) in one roundtrip. */
     public static Map<String, Config> findAllLatest() {
         return Jpa.<Map<String, Config>>tx(em -> {
+            @SuppressWarnings("unchecked")
             List<Object[]> rows = (List<Object[]>) em.createNativeQuery("""
                         SELECT DISTINCT ON (category, key)
                                category,
                                key,
                                operation,
                                taxes,
-                               source_table_key,
                                formulas_json
                           FROM public.calculations
                          ORDER BY category, key, id DESC
                     """).getResultList();
 
             Map<String, Config> out = new HashMap<>(Math.max(16, rows.size() * 2));
-
             for (Object[] a : rows) {
                 String category = (String) a[0];
                 String key = (String) a[1];
@@ -96,11 +93,9 @@ public class CalculationsDao {
                     }
                 }
 
-                String source = (String) a[4];
-                String formulas = (String) a[5];
+                String formulas = (String) a[4];
 
-                Config cfg = new Config(category, key, op, taxes, source, formulas);
-
+                Config cfg = new Config(category, key, op, taxes, formulas);
                 String ck = ((category == null ? "" : category.trim().toUpperCase(java.util.Locale.ROOT))
                         + "|" + (key == null ? "" : key.trim()));
                 out.put(ck, cfg);

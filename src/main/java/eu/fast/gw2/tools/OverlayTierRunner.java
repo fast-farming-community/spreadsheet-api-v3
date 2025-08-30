@@ -1,4 +1,3 @@
-// REPLACE ENTIRE FILE: eu.fast.gw2.tools.OverlayTierRunner
 package eu.fast.gw2.tools;
 
 import java.util.Collections;
@@ -125,7 +124,6 @@ public final class OverlayTierRunner implements Runnable {
                 for (int i = 0; i < rows.size(); i++)
                     OverlayRowComputer.computeRow(rows.get(i), ctx, i, prof, problems);
 
-                // NOTE: No per-table Datasets scanning/persistence here.
                 // Keep detail TOTAL default as SUM (external manual overrides still allowed).
                 OverlayHelper.applyAggregation(rows, "SUM");
 

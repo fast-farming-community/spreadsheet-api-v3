@@ -661,7 +661,6 @@ public class RunDatabaseCompareDelta {
     }
 
     // Record ignored headers and return true if header should be ignored.
-    // NOTE: You said you'll toggle these dynamically; leaving as-is.
     private static boolean markIfIgnored(String field, Set<String> ignoredHeadersSeen) {
         if (field == null)
             return false;

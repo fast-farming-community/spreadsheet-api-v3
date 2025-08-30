@@ -1,3 +1,4 @@
+// REPLACE ENTIRE FILE: eu.fast.gw2.tools.OverlayDslEngine
 package eu.fast.gw2.tools;
 
 import com.fasterxml.jackson.databind.JsonNode;
@@ -10,9 +11,9 @@ import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * STRICT DSL engine:
- * - Requires a formulas_json for every (Category|Key).
+ * - Requires formulas_json for every (Category|Key).
  * - No legacy inference. If formulas are missing/malformed, return null; caller
- * logs & zeroes.
+ * zeros & may log.
  * - Returns unit-level (buy,sell). Detail caller multiplies by AverageAmount;
  * main adds per-hour.
  */
@@ -34,34 +35,28 @@ public class OverlayDslEngine {
             Tier tier,
             int taxesPercent,
             Map<Integer, int[]> priceMap) {
+
         // Look up exact (category|key) config
         CalculationsDao.Config cfg = OverlayCalc.getCalcCfg(category, key);
-        if (cfg == null) {
-            // no formulas known for this pair → strict mode = return null
+        if (cfg == null)
             return null;
-        }
 
         String formulasJson = cfg.formulasJson();
-        if (formulasJson == null || formulasJson.isBlank()) {
+        if (formulasJson == null || formulasJson.isBlank())
             return null;
-        }
 
         try {
             JsonNode root = OM.readTree(formulasJson);
             String mode = optText(root, "mode", null);
 
-            // Variables and functions. NOTE: Key resolves to cfg.sourceTableKey() if
-            // present.
-            DslContext ctx = new DslContext(row, tier, taxesPercent, priceMap,
-                    (cfg.sourceTableKey() == null || cfg.sourceTableKey().isBlank()) ? key : cfg.sourceTableKey());
+            // Variables and functions. "Key" variable == provided key (no override).
+            DslContext ctx = new DslContext(row, tier, taxesPercent, priceMap, key);
 
             // Compile expressions if provided; else synthesize from mode.
             DslExpr exprTPB = compileExprCached(category, key, FIELD_TPB, root.get(FIELD_TPB), mode);
             DslExpr exprTPS = compileExprCached(category, key, FIELD_TPS, root.get(FIELD_TPS), mode);
-
-            if (exprTPB == null || exprTPS == null) {
-                return null; // malformed or missing fields
-            }
+            if (exprTPB == null || exprTPS == null)
+                return null;
 
             long b = Math.round(Math.floor(exprTPB.eval(ctx)));
             long s = Math.round(Math.floor(exprTPS.eval(ctx)));
@@ -104,7 +99,7 @@ public class OverlayDslEngine {
         if (node != null && !node.isNull()) {
             exprText = node.asText(null);
         } else if (mode != null) {
-            // Allow compact mode-only configs
+            // Compact mode-only configs
             switch (mode.trim().toUpperCase(java.util.Locale.ROOT)) {
                 case "LEAF" -> {
                     if (FIELD_TPB.equals(field))
@@ -145,15 +140,14 @@ public class OverlayDslEngine {
         final Tier tier;
         final int taxesPercent;
         final Map<Integer, int[]> priceMap;
-        final String resolvedKey; // either cfg.sourceTableKey or original key
+        final String key; // no override
 
-        DslContext(Map<String, Object> row, Tier tier, int taxesPercent, Map<Integer, int[]> priceMap,
-                String resolvedKey) {
+        DslContext(Map<String, Object> row, Tier tier, int taxesPercent, Map<Integer, int[]> priceMap, String key) {
             this.row = row;
             this.tier = tier;
             this.taxesPercent = taxesPercent;
             this.priceMap = priceMap;
-            this.resolvedKey = resolvedKey;
+            this.key = key;
         }
 
         // Variables
@@ -162,14 +156,14 @@ public class OverlayDslEngine {
                 case "Id" -> OverlayHelper.toInt(row.get(OverlayHelper.COL_ID), -1);
                 case "AverageAmount", "QTY" -> OverlayHelper.toDouble(row.get(OverlayHelper.COL_AVG), 1.0);
                 case "taxes" -> taxesPercent;
-                default -> Double.NaN; // non-numeric vars not supported here
+                default -> Double.NaN;
             };
         }
 
         String strVar(String name) {
             return switch (name) {
                 case "Category" -> OverlayHelper.str(row.get(OverlayHelper.COL_CAT));
-                case "Key" -> resolvedKey; // IMPORTANT: honors source_table_key override automatically
+                case "Key" -> key;
                 case "Name" -> OverlayHelper.str(row.get(OverlayHelper.COL_NAME));
                 default -> null;
             };

@@ -1,37 +1,30 @@
 package eu.fast.gw2.tools;
 
-import java.util.List;
-import java.util.Map;
-
-import eu.fast.gw2.dao.CalculationsDao;
 import eu.fast.gw2.enums.Tier;
 
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+
+/**
+ * Spirit Shard unit profit pair [buyUnit, sellUnit] per tier.
+ * - Always reads from detail key "spirit-shard".
+ * - MAX across all LEAF candidates (unit-level, taxes=0).
+ * - Does NOT multiply by AverageAmount (that's applied by the consumer row).
+ */
 final class OverlaySpiritShard {
 
     /** Cache per tier label -> [buyUnit, sellUnit] */
-    private static final java.util.concurrent.ConcurrentHashMap<String, int[]> CACHE = new java.util.concurrent.ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<String, int[]> CACHE = new ConcurrentHashMap<>();
 
-    /**
-     * Returns the Spirit Shard unit profit pair [buyUnit, sellUnit] for a tier.
-     * - Derived from INTERNAL|spirit-shard
-     * - MAX across all LEAF candidates (unit-level, taxes=0)
-     * - Does NOT multiply by AverageAmount (that's applied at the consumer row)
-     */
     static int[] getShardUnitPair(Tier tier, Map<Integer, int[]> priceMap) {
         final String k = tier.label;
         int[] cached = CACHE.get(k);
         if (cached != null)
             return cached;
 
-        // Locate definition for INTERNAL|spirit-shard (case-insensitive category
-        // handling is in OverlayCalc)
-        CalculationsDao.Config cfg = OverlayCalc.getCalcCfg("INTERNAL", "spirit-shard");
-
-        // Which detail key holds the LEAF candidates. If source_table_key present,
-        // prefer it.
-        final String sourceKey = (cfg != null && cfg.sourceTableKey() != null && !cfg.sourceTableKey().isBlank())
-                ? cfg.sourceTableKey()
-                : "spirit-shard";
+        // Fixed detail key
+        final String sourceKey = "spirit-shard";
 
         // Load the base detail rows that list the leaf candidates
         List<Map<String, Object>> rows = OverlayCache.getBaseDetailRows(sourceKey);

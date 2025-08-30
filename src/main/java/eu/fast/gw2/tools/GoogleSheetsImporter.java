@@ -271,7 +271,6 @@ public class GoogleSheetsImporter implements AutoCloseable {
                 }
             }));
         }
-        // NOTE: do NOT wait/print here. The caller will call awaitCompletion().
     }
 
     /** Block until all submitted chunks finished, then print the final summary. */
