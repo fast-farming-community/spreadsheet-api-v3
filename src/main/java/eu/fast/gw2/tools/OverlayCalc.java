@@ -75,16 +75,21 @@ public class OverlayCalc {
         return CALC_CACHE.get(ck);
     }
 
+    /**
+     * Taxes selection (deterministic):
+     * - INTERNAL / NEGATIVE / UNCHECKED -> 0%
+     * - Else prefer row calc (category|key), else table-level, else 15%
+     * (No more "composite ref => 0" special case)
+     */
     public static int pickTaxesPercent(String category, String key, CalculationsDao.Config tableCfg) {
-        // NEW: NEGATIVE rows are never taxed (exact, case-sensitive match)
-        if ("NEGATIVE".equals(category))
-            return 0;
-
-        if (OverlayHelper.isInternal(category))
-            return 0;
-
-        if (category != null && !category.isBlank() && key != null && !key.isBlank())
-            return 0; // composite ref
+        if (category != null) {
+            if ("INTERNAL".equalsIgnoreCase(category))
+                return 0;
+            if ("NEGATIVE".equalsIgnoreCase(category))
+                return 0;
+            if ("UNCHECKED".equalsIgnoreCase(category))
+                return 0; // will be skipped, but safe
+        }
 
         var rowCfg = getCalcCfg(category, key);
         if (rowCfg != null)

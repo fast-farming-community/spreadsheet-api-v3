@@ -19,8 +19,11 @@ public final class OverlayRowComputer {
     static final class ComputeContext {
         final boolean isMain;
         final Tier tier;
+        /** MAIN: "pageId|pageName"; DETAIL: key */
         final String tableKey;
+        /** DETAIL: fid; MAIN: null */
         final Long detailFeatureIdOrNull;
+        /** Table-level config used only for aggregation fallback */
         final CalculationsDao.Config tableConfig;
         final Map<Integer, int[]> priceByItemId;
         final Map<Integer, String> imageUrlByItemId;
@@ -43,9 +46,8 @@ public final class OverlayRowComputer {
     static void computeRow(Map<String, Object> row, ComputeContext ctx, int rowIndex,
             OverlayProfiler prof, OverlayProblemLog problems) {
 
-        String category = OverlayHelper.str(row.get(OverlayHelper.COL_CAT));
-        String compositeKey = OverlayHelper.str(row.get(OverlayHelper.COL_KEY));
-        int taxesPct = OverlayCalc.pickTaxesPercent(category, compositeKey, ctx.tableConfig);
+        String rawCategory = OverlayHelper.str(row.get(OverlayHelper.COL_CAT));
+        String rawKey = OverlayHelper.str(row.get(OverlayHelper.COL_KEY));
         int itemId = OverlayHelper.toInt(row.get(OverlayHelper.COL_ID), -1);
 
         // enrich image/rarity if we can (safe; does not touch profit numbers)
@@ -58,48 +60,60 @@ public final class OverlayRowComputer {
                 row.put(OverlayHelper.COL_RARITY, rarity);
         }
 
-        // ===== NEW: UNTOUCHED hard stop =====
-        // If Category is exactly "UNTOUCHED" (case-sensitive), DO NOT overwrite any
-        // profit columns (base, hr, wSS).
-        if ("UNTOUCHED".equals(category)) {
+        // UNCHECKED -> do not overwrite profit values
+        if ("UNCHECKED".equalsIgnoreCase(rawCategory)) {
             if (prof != null)
-                prof.fastItem++; // count as a quick path; nothing written
+                prof.fastItem++;
             return;
         }
 
-        // Special currency: Coin (id==1) — write same value to all four
-        if (itemId == 1) {
-            int amt = (int) Math.floor(OverlayHelper.toDouble(row.get(OverlayHelper.COL_AVG), 0.0));
+        // Resolve effective (category,key) deterministically
+        String effCategory;
+        String effKey;
+
+        if ("INTERNAL".equalsIgnoreCase(rawCategory)) {
             if (ctx.isMain) {
-                OverlayHelper.writeFourWithHour(row, amt, amt, amt, amt);
+                int pageId = OverlayDBAccess.pageIdFromComposite(ctx.tableKey);
+                String pageName = OverlayDBAccess.pageNameFromComposite(ctx.tableKey);
+                String featureName = OverlayDBAccess.featureNameByPageId(pageId);
+                effCategory = "INTERNAL";
+                effKey = (featureName == null ? "" : featureName) + "/" + (pageName == null ? "" : pageName);
             } else {
-                OverlayHelper.writeFour(row, amt, amt, amt, amt);
+                effCategory = "INTERNAL";
+                effKey = (rawKey == null ? "" : rawKey);
             }
-            writeSpiritShardAugments(row, ctx);
-            return;
+        } else if ("NEGATIVE".equalsIgnoreCase(rawCategory)) {
+            effCategory = "NEGATIVE";
+            effKey = (rawKey == null ? "" : rawKey);
+        } else {
+            // All other categories resolved via detail_features
+            if (ctx.isMain) {
+                // MAIN: find detail feature by row's key
+                String dfName = OverlayDBAccess.detailFeatureNameByKey(rawKey);
+                effCategory = (dfName == null ? "" : dfName);
+                effKey = (rawKey == null ? "" : rawKey);
+            } else {
+                // DETAIL: we have fid
+                String dfName = (ctx.detailFeatureIdOrNull == null) ? null
+                        : OverlayDBAccess.detailFeatureNameById(ctx.detailFeatureIdOrNull);
+                effCategory = (dfName == null ? "" : dfName);
+                effKey = (rawKey == null ? "" : rawKey);
+            }
         }
 
-        // ========== NEGATIVE category (exact, case-sensitive) ==========
-        // AvgAmount * ( - unit_price buy/sell ) ; NEVER apply tax
-        if ("NEGATIVE".equals(category)) {
+        // NEGATIVE: untaxed, negative unit prices × AvgAmount
+        if ("NEGATIVE".equalsIgnoreCase(effCategory)) {
             double qty = OverlayHelper.toDouble(row.get(OverlayHelper.COL_AVG), 1.0);
-
-            int[] ps = (itemId > 0) ? ctx.priceByItemId.get(itemId) : null;
-            int unitBuy = (ps == null || ps.length < 1) ? 0 : ps[0];
-            int unitSell = (ps == null || ps.length < 2) ? 0 : ps[1];
-
-            int itemBuy = (int) Math.round(qty * (-unitBuy));
-            int itemSell = (int) Math.round(qty * (-unitSell));
-
-            int IB_TPB = itemBuy;
-            int IS_TPB = itemSell;
-            int IB_TPS = itemBuy;
-            int IS_TPS = itemSell;
+            int[] ps = (itemId > 0) ? ctx.priceByItemId.getOrDefault(itemId, new int[] { 0, 0 }) : new int[] { 0, 0 };
+            int unitBuy = (ps.length > 0 ? ps[0] : 0);
+            int unitSell = (ps.length > 1 ? ps[1] : 0);
+            int buy = (int) Math.round(-qty * unitBuy);
+            int sell = (int) Math.round(-qty * unitSell);
 
             if (ctx.isMain)
-                OverlayHelper.writeFourWithHour(row, IB_TPB, IS_TPB, IB_TPS, IS_TPS);
+                OverlayHelper.writeFourWithHour(row, buy, sell, buy, sell);
             else
-                OverlayHelper.writeFour(row, IB_TPB, IS_TPB, IB_TPS, IS_TPS);
+                OverlayHelper.writeFour(row, buy, sell, buy, sell);
 
             writeSpiritShardAugments(row, ctx);
             if (prof != null)
@@ -107,16 +121,17 @@ public final class OverlayRowComputer {
             return;
         }
 
-        // ========== FAST PATH #1: Composite reference ==========
-        if (OverlayHelper.isCompositeRef(category, compositeKey)) {
-            int[] ev = OverlayCalc.evForDetail(compositeKey, ctx.priceByItemId, taxesPct, ctx.tier.columnKey());
-            int evBuy = (ev != null && ev.length > 0) ? ev[0] : 0; // bagEV non-negative
+        // Taxes now based on resolved (category,key)
+        int taxesPct = OverlayCalc.pickTaxesPercent(effCategory, effKey, ctx.tableConfig);
+
+        // INTERNAL composite (MAIN) or composite ref general case: EV path
+        if (effKey != null && !effKey.isBlank()
+                && ("INTERNAL".equalsIgnoreCase(effCategory) || !OverlayHelper.isInternal(effCategory))) {
+            int[] ev = OverlayCalc.evForDetail(effKey, ctx.priceByItemId, taxesPct, ctx.tier.columnKey());
+            int evBuy = (ev != null && ev.length > 0) ? ev[0] : 0;
             int evSell = (ev != null && ev.length > 1) ? ev[1] : 0;
 
-            int IB_TPB = evBuy;
-            int IS_TPB = evBuy;
-            int IB_TPS = evSell;
-            int IS_TPS = evSell;
+            int IB_TPB = evBuy, IS_TPB = evBuy, IB_TPS = evSell, IS_TPS = evSell;
 
             if (!ctx.isMain) {
                 double qty = OverlayHelper.toDouble(row.get(OverlayHelper.COL_AVG), 1.0);
@@ -137,16 +152,12 @@ public final class OverlayRowComputer {
             return;
         }
 
-        // ========== FAST PATH #2: Plain item ==========
-        boolean looksPlainItem = !OverlayHelper.isInternal(category)
-                && (compositeKey == null || compositeKey.isBlank())
-                && itemId > 0;
-
+        // Plain item (no composite key) path
+        boolean looksPlainItem = (effKey == null || effKey.isBlank()) && itemId > 0;
         if (looksPlainItem) {
             int[] ps = ctx.priceByItemId.get(itemId);
-            int tpb = (ps == null || ps.length < 1) ? 0 : ps[0];
-            int tps = (ps == null || ps.length < 2) ? 0 : ps[1];
-
+            int tpb = (ps == null || ps.length < 1) ? 0 : Math.max(0, ps[0]);
+            int tps = (ps == null || ps.length < 2) ? 0 : Math.max(0, ps[1]);
             int sellNet = netSellAfterTax(tps, taxesPct);
 
             if (tpb == 0 && sellNet == 0) {
@@ -155,10 +166,7 @@ public final class OverlayRowComputer {
                     sellNet = vv;
             }
 
-            int IB_TPB = tpb;
-            int IS_TPB = tpb;
-            int IB_TPS = sellNet;
-            int IS_TPS = sellNet;
+            int IB_TPB = tpb, IS_TPB = tpb, IB_TPS = sellNet, IS_TPS = sellNet;
 
             if (!ctx.isMain) {
                 double qty = OverlayHelper.toDouble(row.get(OverlayHelper.COL_AVG), 1.0);
@@ -168,8 +176,8 @@ public final class OverlayRowComputer {
                 IS_TPS = (int) Math.round(IS_TPS * qty);
             }
 
-            if (Math.abs(IB_TPB) < MIN_COPPER && Math.abs(IS_TPS) < MIN_COPPER
-                    && Math.abs(IS_TPB) < MIN_COPPER && Math.abs(IB_TPS) < MIN_COPPER) {
+            if (Math.abs(IB_TPB) < MIN_COPPER && Math.abs(IS_TPB) < MIN_COPPER
+                    && Math.abs(IB_TPS) < MIN_COPPER && Math.abs(IS_TPS) < MIN_COPPER) {
                 if (ctx.isMain)
                     OverlayHelper.writeFourWithHour(row, 0, 0, 0, 0);
                 else
@@ -191,39 +199,21 @@ public final class OverlayRowComputer {
             return;
         }
 
-        // ========== DSL fallback (STRICT) ==========
-        var eval = OverlayDslEngine.evaluateRowStrict(category, compositeKey, row, ctx.tier, taxesPct,
-                ctx.priceByItemId);
-
+        // DSL fallback (STRICT) using resolved (category,key)
+        var eval = OverlayDslEngine.evaluateRowStrict(effCategory, effKey, row, ctx.tier, taxesPct, ctx.priceByItemId);
         if (eval == null) {
-            System.err.printf(java.util.Locale.ROOT,
-                    ctx.isMain
-                            ? "Overlay STRICT(main): missing formulas for (category='%s', key='%s') in table='%s' row#%d name='%s'%n"
-                            : (ctx.detailFeatureIdOrNull == null
-                                    ? "Overlay STRICT(detailCore): missing formulas for (category='%s', key='%s') key='%s' row#%d name='%s'%n"
-                                    : "Overlay STRICT(detail): missing formulas for (category='%s', key='%s') in table='%s' fid=%d row#%d name='%s'%n"),
-                    String.valueOf(category), String.valueOf(compositeKey), ctx.tableKey,
-                    rowIndex, String.valueOf(row.get(OverlayHelper.COL_NAME)));
             if (ctx.isMain)
                 OverlayHelper.writeFourWithHour(row, 0, 0, 0, 0);
             else
                 OverlayHelper.writeFour(row, 0, 0, 0, 0);
-
             writeSpiritShardAugments(row, ctx);
-
             if (problems != null)
                 problems.record(ctx.isMain, ctx.tableKey, ctx.detailFeatureIdOrNull, rowIndex, row, taxesPct,
                         "missing_formulas");
             return;
         }
 
-        int baseBuy = eval.buy();
-        int baseSell = eval.sell();
-
-        int IB_TPB = baseBuy;
-        int IS_TPB = baseBuy;
-        int IB_TPS = baseSell;
-        int IS_TPS = baseSell;
+        int IB_TPB = eval.buy(), IS_TPB = eval.buy(), IB_TPS = eval.sell(), IS_TPS = eval.sell();
 
         if (!ctx.isMain) {
             double qty = OverlayHelper.toDouble(row.get(OverlayHelper.COL_AVG), 1.0);

@@ -111,7 +111,8 @@ public final class OverlayTierRunner implements Runnable {
                 if (profile)
                     prof.rowsDetail += rows.size();
 
-                String tableCategory = OverlayHelper.dominantCategory(rows);
+                // NEW deterministic table config: category is detail_features.name
+                String tableCategory = OverlayDBAccess.detailFeatureNameById(fid);
                 var tableConfig = OverlayCalc.getCalcCfg(tableCategory, key);
 
                 var ctx = new OverlayRowComputer.ComputeContext(false, t, key, fid, tableConfig,
@@ -165,8 +166,13 @@ public final class OverlayTierRunner implements Runnable {
                 if (profile)
                     prof.rowsMain += rows.size();
 
-                String tableCategory = OverlayHelper.dominantCategory(rows);
-                var tableConfig = OverlayCalc.getCalcCfg(tableCategory, compositeKey);
+                // NEW deterministic table config for MAINs:
+                int pageIdForMain = OverlayDBAccess.pageIdFromComposite(compositeKey);
+                String pageNameForMain = OverlayDBAccess.pageNameFromComposite(compositeKey);
+                String featureNameForMain = OverlayDBAccess.featureNameByPageId(pageIdForMain);
+                String aggKey = (featureNameForMain == null ? "" : featureNameForMain)
+                        + "/" + (pageNameForMain == null ? "" : pageNameForMain);
+                var tableConfig = OverlayCalc.getCalcCfg("INTERNAL", aggKey);
 
                 var ctx = new OverlayRowComputer.ComputeContext(true, t, compositeKey, null, tableConfig,
                         priceMap,

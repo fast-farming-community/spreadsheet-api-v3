@@ -5,6 +5,7 @@ import java.sql.DriverManager;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -50,6 +51,15 @@ public class RunDatabaseCompareDelta {
         try (Connection cTest = DriverManager.getConnection(urlTest, user, pass);
                 Connection cProd = DriverManager.getConnection(urlProd, user, pass)) {
 
+            // ---- NEW: logging blocks ----
+            logInternalMainMaxSummaries(cTest, tier);
+
+            String wantDetailCat = System.getenv().getOrDefault("DETAIL_LOG_CATEGORY", "").trim();
+            if (!wantDetailCat.isEmpty()) {
+                logDetailSummariesByCategory(cTest, tier, wantDetailCat);
+            }
+
+            // ---- Existing comparisons ----
             System.out.println(">>> PROD tables vs TEST tables_overlay (tier=" + tier + ")");
             compare(
                     cProd, cTest,
@@ -74,6 +84,177 @@ public class RunDatabaseCompareDelta {
         }
     }
 
+    // ========= NEW: INTERNAL mains MAX logger =========
+    private static void logInternalMainMaxSummaries(Connection test, String tier) throws Exception {
+        System.out.println("=== INTERNAL mains (MAX summaries) @ tier=" + tier + " ===");
+        String sql = """
+                    SELECT page_id, key, rows
+                      FROM public.tables_overlay
+                     WHERE tier = '%s'
+                     ORDER BY page_id, key
+                """.formatted(tier);
+
+        int shown = 0, scanned = 0;
+        try (Statement st = test.createStatement(); ResultSet rs = st.executeQuery(sql)) {
+            while (rs.next()) {
+                scanned++;
+                int pageId = rs.getInt("page_id");
+                String key = rs.getString("key");
+                String json = rs.getString("rows");
+                if (json == null || json.isBlank())
+                    continue;
+
+                JsonNode root;
+                try {
+                    root = M.readTree(json);
+                    normalizeTreeInPlace(root);
+                } catch (Exception e) {
+                    System.err.println("  ! bad JSON at pageId=" + pageId + " key=" + key);
+                    continue;
+                }
+                if (!root.isArray())
+                    continue;
+
+                String domCat = dominantCategory((ArrayNode) root);
+                if (!"INTERNAL".equalsIgnoreCase(domCat)) {
+                    continue;
+                }
+
+                // Walk rows to find maxima and their row names
+                double maxTPB = Double.NEGATIVE_INFINITY, maxTPS = Double.NEGATIVE_INFINITY;
+                String maxTPBName = null, maxTPSName = null;
+
+                ObjectNode total = null;
+                for (JsonNode n : (ArrayNode) root) {
+                    if (!n.isObject())
+                        continue;
+                    ObjectNode o = (ObjectNode) n;
+
+                    String name = text(o, "Name");
+                    String k = text(o, "Key");
+                    boolean isTotal = "TOTAL".equalsIgnoreCase(name) || "TOTAL".equalsIgnoreCase(k);
+                    if (isTotal)
+                        total = o;
+
+                    double vTPB = maxOf(o, IB_TPB, IS_TPB, TPB); // mapped + legacy fallback
+                    double vTPS = maxOf(o, IB_TPS, IS_TPS, TPS);
+
+                    if (vTPB > maxTPB) {
+                        maxTPB = vTPB;
+                        maxTPBName = firstNonBlank(name, k);
+                    }
+                    if (vTPS > maxTPS) {
+                        maxTPS = vTPS;
+                        maxTPSName = firstNonBlank(name, k);
+                    }
+                }
+
+                String bestBuy = (total == null) ? "" : text(total, "BestChoiceBuy");
+                String bestSell = (total == null) ? "" : text(total, "BestChoiceSell");
+
+                System.out.printf(Locale.ROOT,
+                        "INTERNAL | %d|%s : MaxTPBuyProfit=%s (row=\"%s\"), MaxTPSellProfit=%s (row=\"%s\")%s%s%n",
+                        pageId, (key == null ? "" : key),
+                        fmtNum(maxTPB), nz(maxTPBName),
+                        fmtNum(maxTPS), nz(maxTPSName),
+                        bestBuy.isEmpty() ? "" : (", BestChoiceBuy=\"" + bestBuy + "\""),
+                        bestSell.isEmpty() ? "" : (", BestChoiceSell=\"" + bestSell + "\""));
+                shown++;
+            }
+        }
+        if (shown == 0) {
+            System.out.println("  (no INTERNAL mains found for this tier)");
+        } else {
+            System.out.println("=== INTERNAL mains logged: " + shown + " (scanned " + scanned + ") ===");
+        }
+    }
+
+    // ========= NEW: detail summaries for a given category =========
+    private static void logDetailSummariesByCategory(Connection test, String tier, String categoryFilter)
+            throws Exception {
+        System.out.println("=== DETAIL summaries for category=\"" + categoryFilter + "\" @ tier=" + tier + " ===");
+        String sql = """
+                    SELECT detail_feature_id, key, rows
+                      FROM public.detail_tables_overlay
+                     WHERE tier = '%s'
+                     ORDER BY detail_feature_id, key
+                """.formatted(tier);
+
+        int shown = 0, scanned = 0;
+        try (Statement st = test.createStatement(); ResultSet rs = st.executeQuery(sql)) {
+            while (rs.next()) {
+                scanned++;
+                long fid = rs.getLong("detail_feature_id");
+                String key = rs.getString("key");
+                String json = rs.getString("rows");
+                if (json == null || json.isBlank())
+                    continue;
+
+                JsonNode root;
+                try {
+                    root = M.readTree(json);
+                    normalizeTreeInPlace(root);
+                } catch (Exception e) {
+                    System.err.println("  ! bad JSON at fid=" + fid + " key=" + key);
+                    continue;
+                }
+                if (!root.isArray())
+                    continue;
+
+                String domCat = dominantCategory((ArrayNode) root);
+                if (!equalsIgnoreCase(domCat, categoryFilter)) {
+                    continue; // only the requested category
+                }
+
+                // Collect quick stats
+                int rows = 0, nonZero = 0;
+                double sumTPB = 0, sumTPS = 0;
+                double maxTPB = Double.NEGATIVE_INFINITY, maxTPS = Double.NEGATIVE_INFINITY;
+                String maxTPBName = null, maxTPSName = null;
+
+                for (JsonNode n : (ArrayNode) root) {
+                    if (!n.isObject())
+                        continue;
+                    ObjectNode o = (ObjectNode) n;
+                    rows++;
+
+                    double vTPB = maxOf(o, IB_TPB, IS_TPB, TPB);
+                    double vTPS = maxOf(o, IB_TPS, IS_TPS, TPS);
+                    if (Math.abs(vTPB) > 1e-9 || Math.abs(vTPS) > 1e-9)
+                        nonZero++;
+
+                    sumTPB += vTPB;
+                    sumTPS += vTPS;
+
+                    String name = firstNonBlank(text(o, "Name"), text(o, "Key"));
+                    if (vTPB > maxTPB) {
+                        maxTPB = vTPB;
+                        maxTPBName = name;
+                    }
+                    if (vTPS > maxTPS) {
+                        maxTPS = vTPS;
+                        maxTPSName = name;
+                    }
+                }
+
+                System.out.printf(Locale.ROOT,
+                        "DETAIL | %d:%s [%s] : rows=%d nonZero=%d | SumTPB=%s SumTPS=%s | MaxTPB=%s (\"%s\"), MaxTPS=%s (\"%s\")%n",
+                        fid, (key == null ? "" : key), domCat,
+                        rows, nonZero,
+                        fmtNum(sumTPB), fmtNum(sumTPS),
+                        fmtNum(maxTPB), nz(maxTPBName),
+                        fmtNum(maxTPS), nz(maxTPSName));
+                shown++;
+            }
+        }
+        if (shown == 0) {
+            System.out.println("  (no detail tables matched this category/tier)");
+        } else {
+            System.out.println("=== DETAIL summaries logged: " + shown + " (scanned " + scanned + ") ===");
+        }
+    }
+
+    // ========= existing loader (kept, with normalization) =========
     interface KeyFn {
         String key(ResultSet rs) throws SQLException;
     }
@@ -136,7 +317,7 @@ public class RunDatabaseCompareDelta {
                     o.set(IS_TPS, v.deepCopy());
             }
 
-            // Per-hour (tables / mains) — do the same if present
+            // Per-hour (tables / mains)
             if (o.has(TPB_HR) && !o.get(TPB_HR).isNull()) {
                 JsonNode v = o.get(TPB_HR);
                 if (!o.has(IB_TPB_HR))
@@ -151,14 +332,10 @@ public class RunDatabaseCompareDelta {
                 if (!o.has(IS_TPS_HR))
                     o.set(IS_TPS_HR, v.deepCopy());
             }
-
-            // done for this object
-            return;
         }
-
-        // primitives: nothing to do
     }
 
+    // ========= existing compare (unchanged) =========
     private static void compare(Connection prod, Connection test,
             String sqlProd, KeyFn keyFnProd,
             String sqlTest, KeyFn keyFnTest) throws Exception {
@@ -189,7 +366,6 @@ public class RunDatabaseCompareDelta {
             if (jp == null) {
                 if (!isEffectivelyEmpty(jt, ignoredHeadersSeen)) {
                     missProd++;
-                    // suppressed from logs by design
                 } else {
                     suppressedMissing++;
                 }
@@ -513,5 +689,70 @@ public class RunDatabaseCompareDelta {
             return Math.abs(d) <= 1e-9;
         // otherwise, empty string counts as empty
         return normalize(n).isEmpty();
+    }
+
+    // ========= small helpers for logging =========
+    private static String dominantCategory(ArrayNode rows) {
+        Map<String, Integer> freq = new HashMap<>();
+        for (JsonNode n : rows) {
+            if (!n.isObject())
+                continue;
+            String c = normalize(((ObjectNode) n).get("Category"));
+            if (!c.isEmpty()) {
+                freq.merge(c, 1, Integer::sum);
+            }
+        }
+        String best = "";
+        int bestCnt = -1;
+        for (var e : freq.entrySet()) {
+            if (e.getValue() > bestCnt) {
+                bestCnt = e.getValue();
+                best = e.getKey();
+            }
+        }
+        return best;
+    }
+
+    private static String text(ObjectNode o, String field) {
+        JsonNode n = o.get(field);
+        return (n == null || n.isNull()) ? "" : n.asText();
+    }
+
+    private static boolean equalsIgnoreCase(String a, String b) {
+        return a != null && b != null && a.equalsIgnoreCase(b);
+    }
+
+    private static String firstNonBlank(String a, String b) {
+        if (a != null && !a.isBlank())
+            return a;
+        return (b == null ? "" : b);
+    }
+
+    private static String nz(String s) {
+        return (s == null ? "" : s);
+    }
+
+    private static double maxOf(ObjectNode o, String... fields) {
+        double m = Double.NEGATIVE_INFINITY;
+        boolean seen = false;
+        for (String f : fields) {
+            JsonNode n = o.get(f);
+            Double d = asDouble(n);
+            if (d != null) {
+                seen = true;
+                if (d > m)
+                    m = d;
+            }
+        }
+        return seen ? m : 0.0;
+    }
+
+    private static String fmtNum(double d) {
+        if (Double.isInfinite(d) || Double.isNaN(d))
+            return "0";
+        if (Math.abs(d - Math.rint(d)) < 1e-9) {
+            return String.format(Locale.ROOT, "%.0f", d);
+        }
+        return String.format(Locale.ROOT, "%.2f", d);
     }
 }

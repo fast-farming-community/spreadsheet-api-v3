@@ -10,6 +10,11 @@ import java.util.stream.Collectors;
 
 public class OverlayDBAccess {
 
+    // ---- NEW small caches for name lookups ----
+    private static final java.util.concurrent.ConcurrentHashMap<Integer, String> FEATURE_NAME_BY_PAGE = new java.util.concurrent.ConcurrentHashMap<>();
+    private static final java.util.concurrent.ConcurrentHashMap<Long, String> DETAIL_FEATURE_NAME_BY_ID = new java.util.concurrent.ConcurrentHashMap<>();
+    private static final java.util.concurrent.ConcurrentHashMap<String, String> DETAIL_FEATURE_NAME_BY_KEY = new java.util.concurrent.ConcurrentHashMap<>();
+
     public static String getMainRowsJson(String compositeKey /* "pageId|name" */) {
         int bar = compositeKey.indexOf('|');
         int pageId = Integer.parseInt(compositeKey.substring(0, bar));
@@ -152,5 +157,91 @@ public class OverlayDBAccess {
         for (Number n : rows)
             out.add(n.intValue());
         return out;
+    }
+
+    // -------- NEW deterministic-lookups used by computeRow --------
+
+    /** pages.id -> features.name */
+    public static String featureNameByPageId(int pageId) {
+        if (pageId <= 0)
+            return null;
+        String cached = FEATURE_NAME_BY_PAGE.get(pageId);
+        if (cached != null)
+            return cached;
+        String name = Jpa.tx(em -> {
+            var r = em.createNativeQuery("""
+                        SELECT f.name
+                          FROM public.pages p
+                          JOIN public.features f ON f.id = p.feature_id
+                         WHERE p.id = :pid
+                    """).setParameter("pid", pageId).getResultList();
+            return (r.isEmpty() ? null : String.valueOf(r.get(0)));
+        });
+        if (name != null)
+            FEATURE_NAME_BY_PAGE.put(pageId, name);
+        return name;
+    }
+
+    /** parse "pageId|pageName" → pageId (or 0) */
+    public static int pageIdFromComposite(String compositeKey) {
+        if (compositeKey == null)
+            return 0;
+        int bar = compositeKey.indexOf('|');
+        if (bar <= 0)
+            return 0;
+        try {
+            return Integer.parseInt(compositeKey.substring(0, bar));
+        } catch (Exception ignored) {
+            return 0;
+        }
+    }
+
+    /** parse "pageId|pageName" → pageName (never null) */
+    public static String pageNameFromComposite(String compositeKey) {
+        if (compositeKey == null)
+            return "";
+        int bar = compositeKey.indexOf('|');
+        return (bar < 0 ? compositeKey : compositeKey.substring(bar + 1));
+    }
+
+    /** detail_features.id -> name */
+    public static String detailFeatureNameById(long fid) {
+        if (fid <= 0)
+            return null;
+        String cached = DETAIL_FEATURE_NAME_BY_ID.get(fid);
+        if (cached != null)
+            return cached;
+        String name = Jpa.tx(em -> {
+            var r = em.createNativeQuery("""
+                        SELECT name FROM public.detail_features WHERE id = :fid
+                    """).setParameter("fid", fid).getResultList();
+            return (r.isEmpty() ? null : String.valueOf(r.get(0)));
+        });
+        if (name != null)
+            DETAIL_FEATURE_NAME_BY_ID.put(fid, name);
+        return name;
+    }
+
+    /** detail_tables.key -> detail_features.name (latest by key) */
+    public static String detailFeatureNameByKey(String key) {
+        if (key == null || key.isBlank())
+            return null;
+        String cached = DETAIL_FEATURE_NAME_BY_KEY.get(key);
+        if (cached != null)
+            return cached;
+        String name = Jpa.tx(em -> {
+            var r = em.createNativeQuery("""
+                        SELECT df.name
+                          FROM public.detail_tables dt
+                          JOIN public.detail_features df ON df.id = dt.detail_feature_id
+                         WHERE dt.key = :k
+                         ORDER BY dt.id DESC
+                         LIMIT 1
+                    """).setParameter("k", key).getResultList();
+            return (r.isEmpty() ? null : String.valueOf(r.get(0)));
+        });
+        if (name != null)
+            DETAIL_FEATURE_NAME_BY_KEY.put(key, name);
+        return name;
     }
 }
