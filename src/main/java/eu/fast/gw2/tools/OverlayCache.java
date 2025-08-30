@@ -203,7 +203,7 @@ public class OverlayCache {
                     IMAGE_CACHE.putAll(Gw2PricesDao.loadImageUrlsByIds(new java.util.HashSet<>(itm)));
                 }
                 if (!cur.isEmpty()) {
-                    // NEW: fetch proper currency icons
+                    // fetch proper currency icons
                     IMAGE_CACHE.putAll(Gw2PricesDao.loadCurrencyIconsByIds(new java.util.HashSet<>(cur)));
                 }
             }

@@ -51,7 +51,7 @@ public class RunDatabaseCompareDelta {
         try (Connection cTest = DriverManager.getConnection(urlTest, user, pass);
                 Connection cProd = DriverManager.getConnection(urlProd, user, pass)) {
 
-            // ---- NEW: logging blocks ----
+            // ---- logging blocks ----
             logInternalMainMaxSummaries(cTest, tier);
 
             String wantDetailCat = System.getenv().getOrDefault("DETAIL_LOG_CATEGORY", "").trim();
@@ -84,7 +84,7 @@ public class RunDatabaseCompareDelta {
         }
     }
 
-    // ========= NEW: INTERNAL mains MAX logger =========
+    // ========= INTERNAL mains MAX logger =========
     private static void logInternalMainMaxSummaries(Connection test, String tier) throws Exception {
         System.out.println("=== INTERNAL mains (MAX summaries) @ tier=" + tier + " ===");
         String sql = """
@@ -169,7 +169,7 @@ public class RunDatabaseCompareDelta {
         }
     }
 
-    // ========= NEW: detail summaries for a given category =========
+    // ========= detail summaries for a given category =========
     private static void logDetailSummariesByCategory(Connection test, String tier, String categoryFilter)
             throws Exception {
         System.out.println("=== DETAIL summaries for category=\"" + categoryFilter + "\" @ tier=" + tier + " ===");
@@ -335,7 +335,7 @@ public class RunDatabaseCompareDelta {
         }
     }
 
-    // ========= existing compare (unchanged) =========
+    // ========= existing compare =========
     private static void compare(Connection prod, Connection test,
             String sqlProd, KeyFn keyFnProd,
             String sqlTest, KeyFn keyFnTest) throws Exception {

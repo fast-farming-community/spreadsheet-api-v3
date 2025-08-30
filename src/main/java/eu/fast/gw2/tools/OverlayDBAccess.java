@@ -244,4 +244,28 @@ public class OverlayDBAccess {
             DETAIL_FEATURE_NAME_BY_KEY.put(key, name);
         return name;
     }
+
+    public static void upsertCalculationOperation(String category, String key, String operation) {
+        // Normalize inputs first (they can be reassigned locally)
+        String cNorm = (category == null) ? "" : category;
+        String kNorm = (key == null) ? "" : key;
+        if (operation == null || operation.isBlank())
+            return;
+
+        // Final snapshots for lambda capture
+        final String cat0 = cNorm;
+        final String key0 = kNorm;
+        final String op0 = operation.trim().toUpperCase(java.util.Locale.ROOT);
+
+        Jpa.txVoid(em -> em.createNativeQuery("""
+                    INSERT INTO public.calculations (category, key, operation)
+                    VALUES (:c, :k, :o)
+                    ON CONFLICT (category, key) DO UPDATE
+                        SET operation = EXCLUDED.operation
+                """)
+                .setParameter("c", cat0)
+                .setParameter("k", key0)
+                .setParameter("o", op0)
+                .executeUpdate());
+    }
 }
