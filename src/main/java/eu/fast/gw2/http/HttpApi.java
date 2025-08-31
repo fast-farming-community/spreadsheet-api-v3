@@ -34,6 +34,46 @@ public final class HttpApi {
     // shared JSON mapper for detail parsing
     private static final ObjectMapper M = new ObjectMapper();
 
+    // --- CORS allow-list (env override supported) ---
+    private static final java.util.Set<String> ALLOWED_ORIGINS = java.util.Collections.unmodifiableSet(
+            parseOrigins(System.getenv("CORS_ORIGINS"),
+                    java.util.List.of(
+                            "https://fast.farming-community.eu",
+                            "https://farming-community.eu",
+                            "https://www.farming-community.eu",
+                            "http://localhost:4200" // dev only; remove if you don't want it
+                    )));
+
+    private static java.util.Set<String> parseOrigins(String csv, java.util.List<String> defaults) {
+        java.util.LinkedHashSet<String> out = new java.util.LinkedHashSet<>();
+        if (csv != null && !csv.isBlank()) {
+            for (String s : csv.split(",")) {
+                String o = normalizeOrigin(s);
+                if (!o.isBlank())
+                    out.add(o);
+            }
+        } else {
+            for (String s : defaults)
+                out.add(normalizeOrigin(s));
+        }
+        return out;
+    }
+
+    private static String normalizeOrigin(String s) {
+        if (s == null)
+            return "";
+        String t = s.trim();
+        if (t.endsWith("/"))
+            t = t.substring(0, t.length() - 1);
+        return t;
+    }
+
+    private static boolean isAllowedOrigin(String originHeader) {
+        if (originHeader == null)
+            return false;
+        return ALLOWED_ORIGINS.contains(normalizeOrigin(originHeader));
+    }
+
     public static void start() {
         if (app != null)
             return;
@@ -44,6 +84,30 @@ public final class HttpApi {
         app = Javalin.create(cfg -> {
             cfg.jetty.defaultHost = bind;
             cfg.jsonMapper(new JavalinJackson());
+        });
+
+        // CORS (manual, strict allow-list)
+        app.before(ctx -> {
+            String origin = ctx.header("Origin");
+            if (isAllowedOrigin(origin)) {
+                // reflect approved origin only
+                ctx.header("Access-Control-Allow-Origin", origin);
+                ctx.header("Vary", "Origin");
+                // allow headers Angular will send
+                ctx.header("Access-Control-Allow-Headers", "Authorization, Content-Type");
+                // methods your FE uses
+                ctx.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+                // no cookies (we use Bearer)
+                // ctx.header("Access-Control-Allow-Credentials", "true"); // NOT needed
+                ctx.header("Access-Control-Max-Age", "86400"); // 24h preflight cache
+            }
+        });
+
+        // Preflight handler
+        app.options("/*", ctx -> {
+            // If origin not allowed we simply return 204 without ACAO headers,
+            // browsers will block it; curl will still see 204.
+            ctx.status(204);
         });
 
         // Health
