@@ -64,7 +64,6 @@ public class CalculationsDao {
     /** Bulk-load latest row per (category,key) in one roundtrip. */
     public static Map<String, Config> findAllLatest() {
         return Jpa.<Map<String, Config>>tx(em -> {
-            @SuppressWarnings("unchecked")
             List<Object[]> rows = (List<Object[]>) em.createNativeQuery("""
                         SELECT DISTINCT ON (category, key)
                                category,
