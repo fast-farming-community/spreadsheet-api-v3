@@ -41,7 +41,7 @@ public final class HttpApi {
                             "https://fast.farming-community.eu",
                             "https://farming-community.eu",
                             "https://www.farming-community.eu",
-                            "http://localhost:4200" // dev only; remove if you don't want it
+                            "http://localhost:4200" // dev only
                     )));
 
     private static java.util.Set<String> parseOrigins(String csv, java.util.List<String> defaults) {
@@ -73,6 +73,57 @@ public final class HttpApi {
             return false;
         return ALLOWED_ORIGINS.contains(normalizeOrigin(originHeader));
     }
+
+    // ---- Simple token-bucket rate limiter ----
+    private static final class RateLimiter {
+        private static final class Bucket {
+            double tokens;
+            long lastNs;
+        }
+
+        private final double capacity, refillPerSec;
+        private final java.util.concurrent.ConcurrentHashMap<String, Bucket> buckets = new java.util.concurrent.ConcurrentHashMap<>();
+
+        RateLimiter(double capacity, double refillPerSec) {
+            this.capacity = capacity;
+            this.refillPerSec = refillPerSec;
+        }
+
+        boolean allow(String key) {
+            final long now = System.nanoTime();
+            Bucket b = buckets.computeIfAbsent(key, k -> {
+                Bucket nb = new Bucket();
+                nb.tokens = capacity;
+                nb.lastNs = now;
+                return nb;
+            });
+            synchronized (b) {
+                double add = ((now - b.lastNs) / 1_000_000_000.0) * refillPerSec;
+                b.tokens = Math.min(capacity, b.tokens + add);
+                b.lastNs = now;
+                if (b.tokens >= 1.0) {
+                    b.tokens -= 1.0;
+                    return true;
+                }
+                return false;
+            }
+        }
+    }
+
+    // Trust proxy X-Forwarded-For? (true on Uberspace)
+    private static String clientIp(io.javalin.http.Context ctx) {
+        boolean trust = Boolean.parseBoolean(System.getenv().getOrDefault("TRUST_PROXY", "true"));
+        if (trust) {
+            String xff = ctx.header("X-Forwarded-For");
+            if (xff != null && !xff.isBlank())
+                return xff.split(",")[0].trim();
+        }
+        return ctx.req().getRemoteAddr();
+    }
+
+    // Per-IP buckets (tune as needed)
+    private static final RateLimiter RL_AUTH = new RateLimiter(10, 10.0 / 60.0); // 10 requests / minute
+    private static final RateLimiter RL_API = new RateLimiter(120, 120.0 / 60.0); // 120 requests / minute
 
     public static void start() {
         if (app != null)
@@ -108,6 +159,27 @@ public final class HttpApi {
             // If origin not allowed we simply return 204 without ACAO headers,
             // browsers will block it; curl will still see 204.
             ctx.status(204);
+        });
+
+        // Rate limiting (skip preflight OPTIONS)
+        app.before(ctx -> {
+            if ("OPTIONS".equalsIgnoreCase(ctx.method().toString()))
+                return;
+
+            String path = ctx.path();
+            String ip = clientIp(ctx);
+
+            if (path.startsWith("/auth/")) {
+                if (!RL_AUTH.allow(ip)) {
+                    ctx.status(429).header("Retry-After", "5").json(java.util.Map.of("error", "rate_limited"));
+                    return;
+                }
+            } else if (path.startsWith("/api/v1/")) {
+                if (!RL_API.allow(ip)) {
+                    ctx.status(429).header("Retry-After", "1").json(java.util.Map.of("error", "rate_limited"));
+                    return;
+                }
+            }
         });
 
         // Health

@@ -60,7 +60,7 @@ public final class PatreonSyncService {
                 .setParameter("email", email)
                 .executeUpdate();
         if (n == 0) {
-            // user might not exist yet → do nothing (or insert a stub if you want)
+            // user might not exist yet → do nothing
             return 0;
         }
         return n;
