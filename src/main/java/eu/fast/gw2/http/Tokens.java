@@ -7,10 +7,10 @@ import com.auth0.jwt.JWT;
 import com.auth0.jwt.algorithms.Algorithm;
 
 final class Tokens {
-    private static final String ISS = System.getenv().getOrDefault("JWT_ISS", "fast-api");
-    private static final String SECRET = System.getenv().getOrDefault("JWT_SECRET", "change_me");
-    private static final long ACCESS_MIN = Long.parseLong(System.getenv().getOrDefault("JWT_TTL_MINUTES", "1440"));
-    private static final long REFRESH_DAYS = 30; // keep simple for now
+    private static final String ISS = "fast-api";
+    private static final String SECRET = System.getenv("JWT_SECRET");
+    private static final long ACCESS_MIN = 1440;
+    private static final long REFRESH_DAYS = 30;
 
     record Pair(String access, String refresh) {
     }

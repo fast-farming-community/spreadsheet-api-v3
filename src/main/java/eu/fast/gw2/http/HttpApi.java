@@ -1,4 +1,3 @@
-// file: src/main/java/eu/fast/gw2/http/HttpApi.java
 package eu.fast.gw2.http;
 
 import java.time.LocalDateTime;
@@ -25,11 +24,10 @@ import jakarta.persistence.EntityManager;
 public final class HttpApi {
     private static Javalin app;
 
-    private static final String FRONTEND_BASE = System.getenv().getOrDefault("FRONTEND_BASE_URL",
-            "https://fast.farming-community.eu");
-    private static final int BCRYPT_COST = Integer.parseInt(System.getenv().getOrDefault("BCRYPT_COST", "12"));
+    private static final String FRONTEND_BASE = "https://fast.farming-community.eu";
+    private static final int BCRYPT_COST = 12;
 
-    // Password policy: ≥12, upper, lower, digit, special (same as Angular)
+    // Password policy: ≥12, upper, lower, digit, special
     private static final Pattern PASS_POLICY = Pattern.compile(
             "^(?=.*?[A-Z])(?=.*?[a-z])(?=.*?[0-9])(?=.*?[#?!@$%^&*\\-]).{12,}$");
 
@@ -59,13 +57,8 @@ public final class HttpApi {
         app.get("/auth/me", HttpApi::me);
 
         // ---- OVERLAYS (tier-gated, no fallback) ----
-        // main list: /api/v1/:feature/:page (e.g., /api/v1/open-world/alt-parking)
-        app.get("/api/v1/:feature/:page", HttpApi::getMainOverlay);
-
-        // detail item: /api/v1/details/:module/:collection/:item
-        // (e.g.,
-        // /api/v1/details/farming-details/bava-nisos-farmtrain/bouncy-chest-event-bava-nisos)
         app.get("/api/v1/details/:module/:collection/:item", HttpApi::getDetailOverlayItem);
+        app.get("/api/v1/:feature/:page", HttpApi::getMainOverlay);
 
         app.start(port);
         System.out.println("HTTP API listening on " + bind + ":" + port);
