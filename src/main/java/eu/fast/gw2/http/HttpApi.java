@@ -57,8 +57,8 @@ public final class HttpApi {
         app.get("/auth/me", HttpApi::me);
 
         // ---- OVERLAYS (tier-gated, no fallback) ----
-        app.get("/api/v1/details/:module/:collection/:item", HttpApi::getDetailOverlayItem);
-        app.get("/api/v1/:feature/:page", HttpApi::getMainOverlay);
+        app.get("/api/v1/details/{module}/{collection}/{item}", HttpApi::getDetailOverlayItem);
+        app.get("/api/v1/{feature}/{page}", HttpApi::getMainOverlay);
 
         app.start(port);
         System.out.println("HTTP API listening on " + bind + ":" + port);
