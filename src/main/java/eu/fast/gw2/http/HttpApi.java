@@ -171,10 +171,15 @@ public final class HttpApi {
     }
 
     private static User findByEmail(EntityManager em, String email) {
-        var q = em.createQuery("SELECT u FROM User u WHERE u.email = :e", User.class);
-        q.setParameter("e", email);
-        var list = q.getResultList();
-        return list.isEmpty() ? null : list.getFirst();
+        return em.createQuery("""
+                    SELECT u FROM User u
+                    LEFT JOIN FETCH u.role
+                    WHERE u.email = :email
+                """, User.class)
+                .setParameter("email", email)
+                .getResultStream()
+                .findFirst()
+                .orElse(null);
     }
 
     private static String norm(String s) {
