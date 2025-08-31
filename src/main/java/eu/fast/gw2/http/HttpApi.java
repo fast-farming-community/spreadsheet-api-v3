@@ -2,9 +2,16 @@
 package eu.fast.gw2.http;
 
 import java.time.LocalDateTime;
+// added imports for overlay handlers
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.regex.Pattern;
+
+import org.postgresql.util.PGobject;
+
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 
 import at.favre.lib.crypto.bcrypt.BCrypt;
 import eu.fast.gw2.model.Role;
@@ -26,6 +33,9 @@ public final class HttpApi {
     private static final Pattern PASS_POLICY = Pattern.compile(
             "^(?=.*?[A-Z])(?=.*?[a-z])(?=.*?[0-9])(?=.*?[#?!@$%^&*\\-]).{12,}$");
 
+    // shared JSON mapper for detail parsing
+    private static final ObjectMapper M = new ObjectMapper();
+
     public static void start() {
         if (app != null)
             return;
@@ -41,14 +51,21 @@ public final class HttpApi {
         // Health
         app.get("/healthz", ctx -> ctx.json(Map.of("ok", true)));
 
-        // ---- AUTH (phase 1) ----
+        // ---- AUTH ----
         app.post("/auth/pre-register", HttpApi::preRegister);
         app.post("/auth/register", HttpApi::register);
-
-        // ---- AUTH (phase 2) ----
         app.post("/auth/login", HttpApi::login);
         app.post("/auth/refresh", HttpApi::refresh);
         app.get("/auth/me", HttpApi::me);
+
+        // ---- OVERLAYS (tier-gated, no fallback) ----
+        // main list: /api/v1/:feature/:page (e.g., /api/v1/open-world/alt-parking)
+        app.get("/api/v1/:feature/:page", HttpApi::getMainOverlay);
+
+        // detail item: /api/v1/details/:module/:collection/:item
+        // (e.g.,
+        // /api/v1/details/farming-details/bava-nisos-farmtrain/bouncy-chest-event-bava-nisos)
+        app.get("/api/v1/details/:module/:collection/:item", HttpApi::getDetailOverlayItem);
 
         app.start(port);
         System.out.println("HTTP API listening on " + bind + ":" + port);
@@ -151,54 +168,12 @@ public final class HttpApi {
             return new SimpleUser(u.id, u.email, u.role == null ? "soldier" : u.role.name);
         });
 
-        // Issue tokens (we’ll add refresh/login endpoints next; for now return both)
+        // Issue tokens
         var tokens = Tokens.issue(created.email(), created.role());
 
         ctx.json(Map.of(
                 "access", tokens.access(),
                 "refresh", tokens.refresh()));
-    }
-
-    // ---------- Helpers ----------
-
-    private record PreRegisterReq(String email) {
-    }
-
-    private record RegisterReq(String email, String password, String password_confirmation, String token) {
-    }
-
-    private record SimpleUser(Long id, String email, String role) {
-    }
-
-    private static User findByEmail(EntityManager em, String email) {
-        return em.createQuery("""
-                    SELECT u FROM User u
-                    LEFT JOIN FETCH u.role
-                    WHERE u.email = :email
-                """, User.class)
-                .setParameter("email", email)
-                .getResultStream()
-                .findFirst()
-                .orElse(null);
-    }
-
-    private static String norm(String s) {
-        return s == null ? null : s.trim().toLowerCase();
-    }
-
-    private static String urlEnc(String s) {
-        try {
-            return java.net.URLEncoder.encode(s, java.nio.charset.StandardCharsets.UTF_8);
-        } catch (Exception e) {
-            return s;
-        }
-    }
-
-    // Minimal exception bridge
-    private static final class BadRequest extends RuntimeException {
-        BadRequest(String m) {
-            super(m);
-        }
     }
 
     // ====== AUTH PHASE 2 ======
@@ -318,10 +293,234 @@ public final class HttpApi {
                 "verified", user.verified));
     }
 
+    // ---------- Overlay handlers ----------
+
+    // MAIN LIST: /api/v1/:feature/:page (returns rows JSON as-is)
+    private static void getMainOverlay(Context ctx) {
+        String feature = ctx.pathParam("feature"); // e.g. "open-world"
+        String page = ctx.pathParam("page"); // e.g. "alt-parking"
+        Tier tier = tierForRequest(ctx);
+
+        Integer pageId = resolvePageId(feature, page);
+        if (pageId == null) {
+            ctx.status(404).json(Map.of("error", "not_found", "why", "page"));
+            return;
+        }
+
+        String rows = Jpa.tx(em -> {
+            java.util.List<Object> rs = em.createNativeQuery("""
+                        SELECT rows
+                          FROM public.tables_overlay
+                         WHERE page_id = :pid
+                           AND key = :k
+                           AND tier = :t
+                         LIMIT 1
+                    """)
+                    .setParameter("pid", pageId)
+                    .setParameter("k", page)
+                    .setParameter("t", tier.label())
+                    .getResultList();
+            if (rs.isEmpty())
+                return null;
+            return asJsonString(rs.get(0));
+        });
+
+        if (rows == null) {
+            ctx.status(404).json(Map.of("error", "not_found", "why", "overlay_tier_missing", "tier", tier.label()));
+            return;
+        }
+
+        ctx.contentType("application/json").result(rows);
+    }
+
+    // DETAIL ITEM: /api/v1/details/:module/:collection/:item
+    // mirrors v2 semantics, but pulls from *_overlay and enforces tier +
+    // association
+    private static void getDetailOverlayItem(Context ctx) {
+        String module = ctx.pathParam("module"); // e.g. "farming-details"
+        String collection = ctx.pathParam("collection"); // e.g. "bava-nisos-farmtrain"
+        String itemKey = ctx.pathParam("item"); // e.g. "bouncy-chest-event-bava-nisos"
+        String moduleBase = module.endsWith("-details") ? module.substring(0, module.length() - 8) : module;
+
+        Tier tier = tierForRequest(ctx);
+
+        Long dfId = resolveDetailFeatureId(moduleBase);
+        if (dfId == null) {
+            ctx.status(404).json(Map.of("error", "not_found", "why", "detail_feature"));
+            return;
+        }
+
+        String rows = Jpa.tx(em -> {
+            java.util.List<Object> rs = em.createNativeQuery("""
+                        SELECT rows
+                          FROM public.detail_tables_overlay
+                         WHERE detail_feature_id = :dfid
+                           AND key = :k
+                           AND tier = :t
+                         LIMIT 1
+                    """)
+                    .setParameter("dfid", dfId)
+                    .setParameter("k", collection)
+                    .setParameter("t", tier.label())
+                    .getResultList();
+            if (rs.isEmpty())
+                return null;
+            return asJsonString(rs.get(0));
+        });
+
+        if (rows == null) {
+            ctx.status(404).json(Map.of("error", "not_found", "why", "overlay_tier_missing", "tier", tier.label()));
+            return;
+        }
+
+        // rows is a JSON array; return the single element with "Key" == itemKey
+        try {
+            List<Map<String, Object>> arr = M.readValue(rows, new TypeReference<List<Map<String, Object>>>() {
+            });
+            for (Map<String, Object> obj : arr) {
+                Object k = obj.get("Key");
+                if (k != null && itemKey.equals(k.toString())) {
+                    ctx.json(obj);
+                    return;
+                }
+            }
+            ctx.status(404).json(Map.of("error", "not_found", "why", "item", "key", itemKey));
+        } catch (Exception e) {
+            ctx.status(500).json(Map.of("error", "bad_overlay_json"));
+        }
+    }
+
+    // ---------- Helpers & models ----------
+
+    private record PreRegisterReq(String email) {
+    }
+
+    private record RegisterReq(String email, String password, String password_confirmation, String token) {
+    }
+
+    private record SimpleUser(Long id, String email, String role) {
+    }
+
+    private static User findByEmail(EntityManager em, String email) {
+        return em.createQuery("""
+                    SELECT u FROM User u
+                    LEFT JOIN FETCH u.role
+                    WHERE u.email = :email
+                """, User.class)
+                .setParameter("email", email)
+                .getResultStream()
+                .findFirst()
+                .orElse(null);
+    }
+
+    private static String norm(String s) {
+        return s == null ? null : s.trim().toLowerCase();
+    }
+
+    private static String urlEnc(String s) {
+        try {
+            return java.net.URLEncoder.encode(s, java.nio.charset.StandardCharsets.UTF_8);
+        } catch (Exception e) {
+            return s;
+        }
+    }
+
+    // Minimal exception bridge
+    private static final class BadRequest extends RuntimeException {
+        BadRequest(String m) {
+            super(m);
+        }
+    }
+
     private record LoginReq(String email, String password) {
     }
 
     private record RefreshReq(String token) {
     }
 
+    // ===== Overlay helpers =====
+
+    private enum Tier {
+        T2M, T10M, T60M;
+
+        String label() {
+            return switch (this) {
+                case T2M -> "2m";
+                case T10M -> "10m";
+                default -> "60m";
+            };
+        }
+
+        static Tier fromRole(String role) {
+            if (role == null)
+                return T60M;
+            return switch (role) {
+                case "tribune", "khan-ur", "champion" -> T2M;
+                case "legionnaire" -> T10M;
+                default -> T60M; // soldier or anything else
+            };
+        }
+    }
+
+    /** Get caller's tier: unauth => 60m; auth => read role from DB and map. */
+    private static Tier tierForRequest(Context ctx) {
+        String auth = ctx.header("Authorization");
+        if (auth != null && auth.startsWith("Bearer ")) {
+            String email = Tokens.verify(auth.substring(7), false);
+            if (email != null) {
+                var user = Jpa.tx(em -> findByEmail(em, email));
+                if (user != null && Boolean.TRUE.equals(user.verified)) {
+                    String role = (user.role == null ? "soldier" : user.role.name);
+                    return Tier.fromRole(role);
+                }
+            }
+        }
+        return Tier.T60M;
+    }
+
+    /** pages.id by names (feature + page). */
+    private static Integer resolvePageId(String feature, String page) {
+        return Jpa.tx(em -> {
+            java.util.List<Object> rows = em.createNativeQuery("""
+                        SELECT p.id
+                          FROM public.pages p
+                          JOIN public.features f ON f.id = p.feature_id
+                         WHERE f.name = :f AND p.name = :p
+                         LIMIT 1
+                    """)
+                    .setParameter("f", feature)
+                    .setParameter("p", page)
+                    .getResultList();
+            if (rows.isEmpty())
+                return null;
+            return ((Number) rows.get(0)).intValue();
+        });
+    }
+
+    /** detail_features.id by name (module base without '-details'). */
+    private static Long resolveDetailFeatureId(String moduleBase) {
+        return Jpa.tx(em -> {
+            java.util.List<Object> rows = em.createNativeQuery("""
+                        SELECT id FROM public.detail_features
+                         WHERE name = :n
+                         LIMIT 1
+                    """)
+                    .setParameter("n", moduleBase)
+                    .getResultList();
+            if (rows.isEmpty())
+                return null;
+            return ((Number) rows.get(0)).longValue();
+        });
+    }
+
+    /** Convert DB jsonb to String. */
+    private static String asJsonString(Object dbVal) {
+        if (dbVal == null)
+            return null;
+        if (dbVal instanceof String s)
+            return s;
+        if (dbVal instanceof PGobject pg && "jsonb".equalsIgnoreCase(pg.getType()))
+            return pg.getValue();
+        return String.valueOf(dbVal);
+    }
 }
