@@ -45,6 +45,11 @@ public final class HttpApi {
         app.post("/auth/pre-register", HttpApi::preRegister);
         app.post("/auth/register", HttpApi::register);
 
+        // ---- AUTH (phase 2) ----
+        app.post("/auth/login", HttpApi::login);
+        app.post("/auth/refresh", HttpApi::refresh);
+        app.get("/auth/me", HttpApi::me);
+
         app.start(port);
         System.out.println("HTTP API listening on " + bind + ":" + port);
     }
@@ -190,4 +195,128 @@ public final class HttpApi {
             super(m);
         }
     }
+
+    // ====== AUTH PHASE 2 ======
+
+    private static final int MAX_ATTEMPTS = 5;
+    private static final long LOCK_MS = 15 * 60 * 1000L; // 15 min
+
+    // failed login attempts: key=email, value=info
+    private static final java.util.concurrent.ConcurrentHashMap<String, FailedLogin> FAILS = new java.util.concurrent.ConcurrentHashMap<>();
+
+    private record FailedLogin(int attempts, long lockedUntil) {
+    }
+
+    private static void login(Context ctx) {
+        var body = ctx.bodyAsClass(LoginReq.class);
+        String email = norm(body.email);
+        String pass = body.password;
+
+        if (email == null || pass == null) {
+            ctx.status(400).json(Map.of("error", "missing_fields"));
+            return;
+        }
+
+        // Check lockout
+        FailedLogin info = FAILS.get(email);
+        if (info != null && info.lockedUntil > System.currentTimeMillis()) {
+            long left = (info.lockedUntil - System.currentTimeMillis()) / 1000;
+            ctx.status(429).json(Map.of("error", "locked", "retry_after_sec", left));
+            return;
+        }
+
+        // Verify user
+        var user = Jpa.tx(em -> findByEmail(em, email));
+        if (user == null || !Boolean.TRUE.equals(user.verified) || user.password == null) {
+            registerFail(email);
+            ctx.status(401).json(Map.of("error", "invalid_credentials"));
+            return;
+        }
+
+        var result = at.favre.lib.crypto.bcrypt.BCrypt.verifyer().verify(pass.toCharArray(), user.password);
+        if (!result.verified) {
+            registerFail(email);
+            ctx.status(401).json(Map.of("error", "invalid_credentials"));
+            return;
+        }
+
+        // success: reset fails
+        FAILS.remove(email);
+
+        var role = (user.role == null ? "soldier" : user.role.name);
+        var tokens = Tokens.issue(email, role);
+        ctx.json(Map.of("access", tokens.access(), "refresh", tokens.refresh()));
+    }
+
+    private static void registerFail(String email) {
+        long now = System.currentTimeMillis();
+        FAILS.compute(email, (k, v) -> {
+            if (v == null)
+                return new FailedLogin(1, 0);
+            int next = v.attempts + 1;
+            if (next >= MAX_ATTEMPTS) {
+                return new FailedLogin(next, now + LOCK_MS);
+            }
+            return new FailedLogin(next, 0);
+        });
+    }
+
+    private static void refresh(Context ctx) {
+        var body = ctx.bodyAsClass(RefreshReq.class);
+        if (body.token == null) {
+            ctx.status(400).json(Map.of("error", "missing_token"));
+            return;
+        }
+
+        var email = Tokens.verify(body.token, true); // verify refresh
+        if (email == null) {
+            ctx.status(401).json(Map.of("error", "invalid_token"));
+            return;
+        }
+
+        // fetch user to get current role
+        var user = Jpa.tx(em -> findByEmail(em, email));
+        if (user == null || !Boolean.TRUE.equals(user.verified)) {
+            ctx.status(401).json(Map.of("error", "user_not_found"));
+            return;
+        }
+
+        var role = (user.role == null ? "soldier" : user.role.name);
+        var pair = Tokens.issue(email, role);
+        ctx.json(Map.of("access", pair.access()));
+    }
+
+    private static void me(Context ctx) {
+        String auth = ctx.header("Authorization");
+        if (auth == null || !auth.startsWith("Bearer ")) {
+            ctx.status(401).json(Map.of("error", "missing_token"));
+            return;
+        }
+        String token = auth.substring(7);
+
+        var email = Tokens.verify(token, false); // access token
+        if (email == null) {
+            ctx.status(401).json(Map.of("error", "invalid_token"));
+            return;
+        }
+
+        var user = Jpa.tx(em -> findByEmail(em, email));
+        if (user == null) {
+            ctx.status(401).json(Map.of("error", "user_not_found"));
+            return;
+        }
+
+        var role = (user.role == null ? "soldier" : user.role.name);
+        ctx.json(Map.of(
+                "email", user.email,
+                "role", role,
+                "verified", user.verified));
+    }
+
+    private record LoginReq(String email, String password) {
+    }
+
+    private record RefreshReq(String token) {
+    }
+
 }

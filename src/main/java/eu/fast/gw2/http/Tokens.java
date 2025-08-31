@@ -42,6 +42,25 @@ final class Tokens {
         return new Pair(access, refresh);
     }
 
+    static String verify(String token, boolean refresh) {
+        try {
+            var alg = Algorithm.HMAC256(SECRET);
+            var verifier = JWT.require(alg).withIssuer(ISS).build();
+            var decoded = verifier.verify(token);
+
+            if (refresh) {
+                if (!"refresh".equals(decoded.getClaim("type").asString()))
+                    return null;
+            } else {
+                if ("refresh".equals(decoded.getClaim("type").asString()))
+                    return null;
+            }
+            return decoded.getClaim("email").asString();
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
     private Tokens() {
     }
 }
