@@ -80,11 +80,10 @@ public class OverlayDBAccess {
     /** Distinct main table names. */
     public static List<String> listMainTargets() {
         return Jpa.tx(em -> (java.util.List<Object[]>) em.createNativeQuery("""
-                SELECT DISTINCT p.id AS page_id, p.name AS page_name
-                  FROM public.tables t
-                  JOIN public.pages p ON p.id = t.page_id
-                 ORDER BY p.id, p.name
-                                """).getResultList())
+                    SELECT DISTINCT page_id, name
+                      FROM public.tables
+                     ORDER BY page_id, name
+                """).getResultList())
                 .stream()
                 .map(r -> ((Number) r[0]).intValue() + "|" + (String) r[1]) // "pageId|name"
                 .toList();
@@ -160,7 +159,7 @@ public class OverlayDBAccess {
         return out;
     }
 
-    // -------- NEW deterministic-lookups used by computeRow --------
+    // -------- deterministic-lookups used by computeRow --------
 
     /** pages.id -> features.name */
     public static String featureNameByPageId(int pageId) {
@@ -269,4 +268,26 @@ public class OverlayDBAccess {
                 .setParameter("o", op0)
                 .executeUpdate());
     }
+
+    // small cache for pages.id -> pages.name (slug)
+    private static final java.util.concurrent.ConcurrentHashMap<Integer, String> PAGE_NAME_BY_ID = new java.util.concurrent.ConcurrentHashMap<>();
+
+    public static String pageNameById(int pageId) {
+        if (pageId <= 0)
+            return null;
+        String cached = PAGE_NAME_BY_ID.get(pageId);
+        if (cached != null)
+            return cached;
+
+        String name = Jpa.tx(em -> {
+            var rows = em.createNativeQuery("SELECT name FROM public.pages WHERE id = :pid")
+                    .setParameter("pid", pageId)
+                    .getResultList();
+            return rows.isEmpty() ? null : String.valueOf(rows.get(0));
+        });
+        if (name != null)
+            PAGE_NAME_BY_ID.put(pageId, name);
+        return name;
+    }
+
 }

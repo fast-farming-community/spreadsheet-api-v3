@@ -143,9 +143,15 @@ public final class OverlayBatchWriter implements AutoCloseable {
             for (MainRow m : mainBuf) {
                 int bar = m.key.indexOf('|');
                 int pageId = Integer.parseInt(m.key.substring(0, bar));
-                String name = m.key.substring(bar + 1);
+                String tableName = m.key.substring(bar + 1);
+
+                String pageKey = OverlayDBAccess.pageNameById(pageId);
+                if (pageKey == null || pageKey.isBlank()) {
+                    pageKey = tableName; // safe fallback
+                }
+
                 q.setParameter(p++, pageId);
-                q.setParameter(p++, name); // goes to 'key' column
+                q.setParameter(p++, pageKey); // <- overlay key = page slug
                 q.setParameter(p++, m.tier);
                 q.setParameter(p++, m.json);
             }
