@@ -54,6 +54,7 @@ public final class HttpApi {
         app.post("/auth/register", HttpApi::register);
         app.post("/auth/login", HttpApi::login);
         app.post("/auth/refresh", HttpApi::refresh);
+        app.post("/auth/change-password", HttpApi::changePassword);
         app.get("/auth/me", HttpApi::me);
 
         // ---- OVERLAYS (tier-gated, no fallback) ----
@@ -169,8 +170,6 @@ public final class HttpApi {
                 "refresh", tokens.refresh()));
     }
 
-    // ====== AUTH PHASE 2 ======
-
     private static final int MAX_ATTEMPTS = 5;
     private static final long LOCK_MS = 15 * 60 * 1000L; // 15 min
 
@@ -257,6 +256,96 @@ public final class HttpApi {
         var role = (user.role == null ? "soldier" : user.role.name);
         var pair = Tokens.issue(email, role);
         ctx.json(Map.of("access", pair.access()));
+    }
+
+    // ---- small lockout for change-password ----
+    private static final java.util.concurrent.ConcurrentHashMap<String, FailedLogin> CPW_FAILS = new java.util.concurrent.ConcurrentHashMap<>();
+
+    private static void changePassword(Context ctx) {
+        // Must be authenticated (access token)
+        String auth = ctx.header("Authorization");
+        if (auth == null || !auth.startsWith("Bearer ")) {
+            ctx.status(401).json(Map.of("error", "missing_token"));
+            return;
+        }
+        String email = Tokens.verify(auth.substring(7), false);
+        if (email == null) {
+            ctx.status(401).json(Map.of("error", "invalid_token"));
+            return;
+        }
+
+        // Parse body
+        var body = ctx.bodyAsClass(ChangePasswordReq.class);
+        String oldPw = body.old_password();
+        String newPw = body.new_password();
+        String confirm = body.password_confirmation();
+
+        if (oldPw == null || newPw == null || confirm == null) {
+            ctx.status(400).json(Map.of("error", "missing_fields"));
+            return;
+        }
+        if (!newPw.equals(confirm)) {
+            ctx.status(400).json(Map.of("error", "password_mismatch"));
+            return;
+        }
+        if (!PASS_POLICY.matcher(newPw).matches()) {
+            ctx.status(400).json(Map.of("error", "weak_password"));
+            return;
+        }
+        if (newPw.equals(oldPw)) {
+            ctx.status(400).json(Map.of("error", "password_reuse"));
+            return;
+        }
+
+        // Lockout (separate from login lockout)
+        FailedLogin info = CPW_FAILS.get(email);
+        if (info != null && info.lockedUntil() > System.currentTimeMillis()) {
+            long left = (info.lockedUntil() - System.currentTimeMillis()) / 1000;
+            ctx.status(429).json(Map.of("error", "locked", "retry_after_sec", left));
+            return;
+        }
+
+        var ok = Jpa.tx(em -> {
+            User u = findByEmail(em, email);
+            if (u == null || u.password == null)
+                return false;
+
+            var verified = at.favre.lib.crypto.bcrypt.BCrypt.verifyer()
+                    .verify(oldPw.toCharArray(), u.password).verified;
+            if (!verified)
+                return false;
+
+            String newHash = at.favre.lib.crypto.bcrypt.BCrypt.withDefaults()
+                    .hashToString(BCRYPT_COST, newPw.toCharArray());
+
+            u.password = newHash;
+            u.updatedAt = java.time.LocalDateTime.now();
+            em.merge(u);
+            return true;
+        });
+
+        if (!ok) {
+            // count a failed attempt on wrong old password
+            long now = System.currentTimeMillis();
+            CPW_FAILS.compute(email, (k, v) -> {
+                if (v == null)
+                    return new FailedLogin(1, 0);
+                int next = v.attempts() + 1;
+                if (next >= MAX_ATTEMPTS)
+                    return new FailedLogin(next, now + LOCK_MS);
+                return new FailedLogin(next, 0);
+            });
+            ctx.status(403).json(Map.of("error", "invalid_old_password"));
+            return;
+        }
+
+        // success — clear failures
+        CPW_FAILS.remove(email);
+        ctx.json(Map.of("success", true));
+    }
+
+    // body mapping for change-password
+    private record ChangePasswordReq(String old_password, String new_password, String password_confirmation) {
     }
 
     private static void me(Context ctx) {
