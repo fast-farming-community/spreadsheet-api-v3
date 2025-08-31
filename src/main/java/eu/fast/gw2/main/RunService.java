@@ -22,7 +22,7 @@ public class RunService {
             System.err.println("DB CHECK FAILED: " + e.getMessage());
         }
 
-        // --- NEW: start HTTP API (non-blocking) ---
+        // --- start HTTP API (non-blocking) ---
         try {
             HttpApi.start(); // listens on API_BIND:API_PORT
         } catch (Exception e) {

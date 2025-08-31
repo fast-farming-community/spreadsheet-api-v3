@@ -18,6 +18,17 @@ public final class PatreonSyncService {
         final int premiumMin = Integer.parseInt(System.getenv().getOrDefault("PATREON_PREMIUM_MIN_CENTS", "500"));
         final Set<String> emails = patrons.keySet();
 
+        boolean hasPaidUsers = Jpa.tx(em -> ((Number) em.createNativeQuery("""
+                    SELECT COUNT(*) FROM public.users
+                    WHERE role_id IN ('legionnaire','tribune','khan-ur','champion')
+                """).getSingleResult()).longValue() > 0);
+
+        if (patrons.isEmpty() && hasPaidUsers) {
+            System.err.println("[Patreon] fetched 0 patrons while paid roles exist — skipping downgrades this run.");
+            // still return result counters as 0, no writes performed
+            return new Result(0, 0);
+        }
+
         return Jpa.tx(em -> {
             int up = 0, down = 0;
 
