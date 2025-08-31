@@ -20,22 +20,23 @@ public class RefreshTierPrices {
     public record Summary(int picked, int updated2m, int updated10m, int updated60m, int vendorUpdated) {
     }
 
-    /** Refactored runner (no main). */
+    /** summary runner */
     public static Summary refresh(Integer overallCap, int sleepMs) throws Exception {
         final long runStart = System.currentTimeMillis();
 
-        System.out.println(">>> RefreshTierPrices (multi-tier) overallCap=" +
-                (overallCap == null ? "all" : overallCap) +
-                " batch=" + BATCH + " sleepMs=" + sleepMs);
+        // Compute threshold once
+        final int activityThreshold = 5000;
 
-        List<DueRow> candidates = pickDueCandidates(overallCap);
-        if (candidates.isEmpty()) {
-            System.out.println("No stale items for any tier. Nothing to do.");
-            System.out.printf(Locale.ROOT, "RefreshTierPrices done in %.1fs%n",
-                    (System.currentTimeMillis() - runStart) / 1000.0);
-            return new Summary(0, 0, 0, 0, 0);
-        }
-        System.out.println("Picked " + candidates.size() + " items to refresh.");
+        // Minimal start line
+        System.out.printf(Locale.ROOT,
+                "Started RefreshTierPrices: batch=%d, sleepMs=%d, activityThreshold=%d%n",
+                BATCH, sleepMs, activityThreshold);
+
+        // Pick due candidates
+        List<DueRow> candidates = pickDueCandidates(overallCap, activityThreshold);
+
+        // Minimal picked line
+        System.out.println("Refreshing " + candidates.size() + " items...");
 
         int total = candidates.size();
         int batches = (total + BATCH - 1) / BATCH;
@@ -176,11 +177,6 @@ public class RefreshTierPrices {
                 System.err.println("Batch " + (bi + 1) + ": DB upsert failed (" + e.getMessage() + ").");
             }
 
-            // --- concise batch line only ---
-            System.out.printf(Locale.ROOT,
-                    "  [%d/%d] batch done: 2m=%d, 10m+=%d, 60m+=%d%n",
-                    end, total, normalized.size(), due10.size(), due60.size());
-
             if (end < total && sleepMs > 0) {
                 try {
                     Thread.sleep(sleepMs);
@@ -203,11 +199,7 @@ public class RefreshTierPrices {
      * one-shot candidate picker with due flags for 10/60 + vendor/image/rarity
      * missing
      */
-    private static List<DueRow> pickDueCandidates(Integer overallCap) {
-        final int fastMin = 2, slowMin = 60;
-        final int activityThreshold = Integer.parseInt(
-                Optional.ofNullable(System.getenv("GW2_LISTINGS_THRESHOLD")).orElse("5000"));
-
+    private static List<DueRow> pickDueCandidates(Integer overallCap, int activityThreshold) {
         return Jpa.tx(em -> {
             String sql = """
                     WITH candidates AS (
@@ -251,14 +243,10 @@ public class RefreshTierPrices {
 
             var q = em.createNativeQuery(sql);
             q.setParameter("thr", activityThreshold);
-            q.setParameter("fast", fastMin);
-            q.setParameter("slow", slowMin);
             if (overallCap != null)
                 q.setParameter("lim", overallCap);
 
             List<Object[]> rows = q.getResultList();
-            System.out.printf(Locale.ROOT, "Stale: picked=%d (thr=%d, fast=%dm, slow=%dm)%n",
-                    rows.size(), activityThreshold, fastMin, slowMin);
 
             List<DueRow> out = new ArrayList<>(rows.size());
             for (int i = 0; i < rows.size(); i++) {
