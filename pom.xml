@@ -16,6 +16,27 @@
 
   <dependencies>
 
+    <!-- HTTP server -->
+    <dependency>
+      <groupId>io.javalin</groupId>
+      <artifactId>javalin</artifactId>
+      <version>6.7.0</version>
+    </dependency>
+
+    <!-- JWT -->
+    <dependency>
+      <groupId>com.auth0</groupId>
+      <artifactId>java-jwt</artifactId>
+      <version>4.5.0</version>
+    </dependency>
+
+    <!-- BCrypt (pure Java) -->
+    <dependency>
+      <groupId>at.favre.lib</groupId>
+      <artifactId>bcrypt</artifactId>
+      <version>0.10.2</version>
+    </dependency>
+
     <!-- Google API client core -->
     <dependency>
       <groupId>com.google.api-client</groupId>

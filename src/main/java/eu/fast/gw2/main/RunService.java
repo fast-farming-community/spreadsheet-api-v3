@@ -2,6 +2,7 @@ package eu.fast.gw2.main;
 
 import java.util.concurrent.atomic.AtomicBoolean;
 
+import eu.fast.gw2.http.HttpApi;
 import eu.fast.gw2.tools.Jpa;
 
 public class RunService {
@@ -21,7 +22,22 @@ public class RunService {
             System.err.println("DB CHECK FAILED: " + e.getMessage());
         }
 
-        Runtime.getRuntime().addShutdownHook(new Thread(() -> stop = true, "gw2-shutdown"));
+        // --- NEW: start HTTP API (non-blocking) ---
+        try {
+            HttpApi.start(); // listens on API_BIND:API_PORT
+        } catch (Exception e) {
+            System.err.println("HTTP API START FAILED: " + e.getMessage());
+            // hard fail is safer in auth contexts; if you prefer, continue
+            System.exit(1);
+        }
+
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            stop = true;
+            try {
+                HttpApi.stop();
+            } catch (Exception ignored) {
+            }
+        }, "gw2-shutdown"));
 
         long next = alignToNextTick(System.currentTimeMillis(), PERIOD_MS);
         System.out.println("GW2 Service: started, period=" + PERIOD_MS + " ms");
@@ -53,7 +69,7 @@ public class RunService {
     }
 
     private static long alignToNextTick(long now, long period) {
-        return now - (now % period) + period; // align to :00, :05, :10, ...
+        return now - (now % period) + period; // align to :00, :02, :04, ...
     }
 
     private static void sleep(long ms) {

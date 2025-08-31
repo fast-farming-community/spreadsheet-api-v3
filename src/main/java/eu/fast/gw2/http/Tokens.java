@@ -1,0 +1,47 @@
+package eu.fast.gw2.http;
+
+import java.time.Instant;
+import java.util.Date;
+
+import com.auth0.jwt.JWT;
+import com.auth0.jwt.algorithms.Algorithm;
+
+final class Tokens {
+    private static final String ISS = System.getenv().getOrDefault("JWT_ISS", "fast-api");
+    private static final String SECRET = System.getenv().getOrDefault("JWT_SECRET", "change_me");
+    private static final long ACCESS_MIN = Long.parseLong(System.getenv().getOrDefault("JWT_TTL_MINUTES", "1440"));
+    private static final long REFRESH_DAYS = 30; // keep simple for now
+
+    record Pair(String access, String refresh) {
+    }
+
+    static Pair issue(String email, String role) {
+        var alg = Algorithm.HMAC256(SECRET);
+
+        Instant now = Instant.now();
+        Instant expAccess = now.plusSeconds(ACCESS_MIN * 60);
+        Instant expRefresh = now.plusSeconds(REFRESH_DAYS * 86400);
+
+        String access = JWT.create()
+                .withIssuer(ISS)
+                .withSubject(email)
+                .withClaim("email", email)
+                .withClaim("role", role)
+                .withIssuedAt(Date.from(now))
+                .withExpiresAt(Date.from(expAccess))
+                .sign(alg);
+
+        String refresh = JWT.create()
+                .withIssuer(ISS)
+                .withSubject(email)
+                .withClaim("type", "refresh")
+                .withIssuedAt(Date.from(now))
+                .withExpiresAt(Date.from(expRefresh))
+                .sign(alg);
+
+        return new Pair(access, refresh);
+    }
+
+    private Tokens() {
+    }
+}
