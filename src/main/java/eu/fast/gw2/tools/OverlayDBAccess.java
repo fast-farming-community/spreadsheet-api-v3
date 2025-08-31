@@ -80,10 +80,11 @@ public class OverlayDBAccess {
     /** Distinct main table names. */
     public static List<String> listMainTargets() {
         return Jpa.tx(em -> (java.util.List<Object[]>) em.createNativeQuery("""
-                    SELECT DISTINCT page_id, name
-                      FROM public.tables
-                     ORDER BY page_id, name
-                """).getResultList())
+                SELECT DISTINCT p.id AS page_id, p.name AS page_name
+                  FROM public.tables t
+                  JOIN public.pages p ON p.id = t.page_id
+                 ORDER BY p.id, p.name
+                                """).getResultList())
                 .stream()
                 .map(r -> ((Number) r[0]).intValue() + "|" + (String) r[1]) // "pageId|name"
                 .toList();
