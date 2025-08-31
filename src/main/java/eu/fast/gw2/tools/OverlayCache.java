@@ -236,21 +236,8 @@ public class OverlayCache {
                 if (!itm.isEmpty()) {
                     RARITY_CACHE.putAll(Gw2PricesDao.loadRaritiesByIds(new java.util.HashSet<>(itm)));
                 }
-                // For currencies we intentionally do NOT set any rarity -> leave absent
-                // (If you want explicit empty, you could put "", but current computeRow only
-                // writes when non-blank)
             }
         }
         return RARITY_CACHE;
-    }
-
-    // ----- optional: clear per-run caches (call between runs if desired) -----
-    public static void clearRunCaches() {
-        // keep DETAIL_ROWS_CACHE & EV_CACHE (they’re useful across runs)
-        PRICE_CACHE_BY_TIER.clear();
-        IMAGE_CACHE.clear();
-        RARITY_CACHE.clear();
-        MAIN_ROWS_BASE.clear();
-        DETAIL_ROWS_BASE.clear();
     }
 }
