@@ -225,8 +225,8 @@ public class RefreshTierPrices {
                       OR ts_2m IS NULL
                       OR ts_2m < now() - (
                             CASE WHEN activity >= :thr
-                                 THEN make_interval(mins := :fast)
-                                 ELSE make_interval(mins := :slow)
+                                 THEN make_interval(mins := 2)
+                                 ELSE make_interval(mins := 60)
                             END
                       )
                       OR ts_10m IS NULL OR ts_10m < now() - make_interval(mins := 10)
