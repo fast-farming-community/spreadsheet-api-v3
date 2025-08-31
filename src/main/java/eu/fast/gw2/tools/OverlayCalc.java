@@ -7,6 +7,7 @@ import java.util.Map;
 import java.util.Set;
 
 import eu.fast.gw2.dao.CalculationsDao;
+import eu.fast.gw2.dao.Gw2PricesDao;
 
 public class OverlayCalc {
 
@@ -137,7 +138,7 @@ public class OverlayCalc {
             }
         }
         if (missing != null && !missing.isEmpty()) {
-            priceMap.putAll(eu.fast.gw2.dao.Gw2PricesDao.loadTier(missing, tierKey));
+            priceMap.putAll(Gw2PricesDao.loadTier(missing, tierKey));
         }
     }
 

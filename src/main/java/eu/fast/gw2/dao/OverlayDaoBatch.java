@@ -3,6 +3,7 @@ package eu.fast.gw2.dao;
 import java.util.List;
 
 import eu.fast.gw2.tools.Jpa;
+import eu.fast.gw2.tools.OverlayDBAccess;
 import jakarta.persistence.Query;
 
 public class OverlayDaoBatch {
@@ -41,8 +42,16 @@ public class OverlayDaoBatch {
             Query q = em.createNativeQuery(sql);
             int p = 1;
             for (int i = 0; i < pageIds.size(); i++) {
-                q.setParameter(p++, pageIds.get(i));
-                q.setParameter(p++, names.get(i));
+                int pid = pageIds.get(i);
+                String tableName = names.get(i);
+
+                // translate pageId -> pages.name (slug)
+                String pageKey = OverlayDBAccess.pageNameById(pid);
+                if (pageKey == null || pageKey.isBlank())
+                    pageKey = tableName; // fallback
+
+                q.setParameter(p++, pid);
+                q.setParameter(p++, pageKey); // <— write slug
                 q.setParameter(p++, tiers.get(i));
                 q.setParameter(p++, jsons.get(i));
             }

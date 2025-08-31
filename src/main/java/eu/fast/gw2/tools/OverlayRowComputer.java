@@ -1,4 +1,3 @@
-// REPLACE ENTIRE FILE: eu.fast.gw2.tools.OverlayRowComputer
 package eu.fast.gw2.tools;
 
 import java.util.ArrayList;
