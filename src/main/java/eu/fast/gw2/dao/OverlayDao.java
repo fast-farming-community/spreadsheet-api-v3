@@ -1,7 +1,6 @@
 package eu.fast.gw2.dao;
 
 import eu.fast.gw2.tools.Jpa;
-import eu.fast.gw2.tools.OverlayDBAccess;
 
 public final class OverlayDao {
     private OverlayDao() {
@@ -31,9 +30,6 @@ public final class OverlayDao {
 
     /** New preferred per-row upsert using page_id + name + tier. */
     public static void upsertMain(int pageId, String name, String tier, String rowsJson) {
-        String pk = OverlayDBAccess.pageNameById(pageId);
-        final String pageKeyFinal = (pk == null || pk.isBlank()) ? name : pk;
-
         Jpa.txVoid(em -> em.createNativeQuery("""
                     INSERT INTO public.tables_overlay(page_id, key, tier, rows, updated_at)
                     VALUES (:pid,:k,:t,CAST(:rows AS jsonb), now())
@@ -42,18 +38,10 @@ public final class OverlayDao {
                     WHERE public.tables_overlay.rows IS DISTINCT FROM EXCLUDED.rows
                 """)
                 .setParameter("pid", pageId)
-                .setParameter("k", pageKeyFinal) // capture the final value
+                .setParameter("k", name)
                 .setParameter("t", tier)
                 .setParameter("rows", rowsJson)
                 .executeUpdate());
-    }
-
-    /**
-     * Back-compat per-row upsert (old signature).
-     * Uses page_id = 0 as a fallback.
-     */
-    public static void upsertMain(String key, String tier, String rowsJson) {
-        upsertMain(0, key, tier, rowsJson);
     }
 
     // -------------------------

@@ -300,30 +300,42 @@ public final class HttpApi {
             return;
         }
 
-        String rows = Jpa.tx(em -> {
-            java.util.List<Object> rs = em.createNativeQuery("""
-                        SELECT rows
-                          FROM public.tables_overlay
-                         WHERE page_id = :pid
-                           AND key = :k
-                           AND tier = :t
-                         LIMIT 1
-                    """)
-                    .setParameter("pid", pageId)
-                    .setParameter("k", page)
-                    .setParameter("t", tier.label())
-                    .getResultList();
-            if (rs.isEmpty())
-                return null;
-            return asJsonString(rs.get(0));
-        });
+        // Fetch ALL tables for this page & tier and concatenate their arrays
+        List<Object> dbVals = Jpa.tx(em -> em.createNativeQuery("""
+                    SELECT rows
+                      FROM public.tables_overlay
+                     WHERE page_id = :pid
+                       AND tier = :t
+                     ORDER BY key ASC
+                """)
+                .setParameter("pid", pageId)
+                .setParameter("t", tier.label())
+                .getResultList());
 
-        if (rows == null) {
-            ctx.status(404).json(Map.of("error", "not_found", "why", "overlay_tier_missing", "tier", tier.label()));
+        if (dbVals == null || dbVals.isEmpty()) {
+            ctx.status(404).json(Map.of(
+                    "error", "not_found",
+                    "why", "overlay_tier_missing",
+                    "tier", tier.label()));
             return;
         }
 
-        ctx.contentType("application/json").result(rows);
+        try {
+            java.util.ArrayList<java.util.Map<String, Object>> out = new java.util.ArrayList<>(1024);
+            for (Object dv : dbVals) {
+                String rowsJson = asJsonString(dv); // your helper that handles PGobject/String
+                if (rowsJson == null || rowsJson.isBlank())
+                    continue;
+                var arr = M.readValue(rowsJson,
+                        new com.fasterxml.jackson.core.type.TypeReference<java.util.List<java.util.Map<String, Object>>>() {
+                        });
+                if (arr != null && !arr.isEmpty())
+                    out.addAll(arr);
+            }
+            ctx.json(out);
+        } catch (Exception e) {
+            ctx.status(500).json(Map.of("error", "bad_overlay_json"));
+        }
     }
 
     // DETAIL ITEM: /api/v1/details/:module/:collection/:item
