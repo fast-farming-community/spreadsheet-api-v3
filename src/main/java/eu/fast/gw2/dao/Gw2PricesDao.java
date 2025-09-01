@@ -217,7 +217,7 @@ public class Gw2PricesDao {
 
         try {
             // Build query string: e.g. ids=1,2,3
-            StringBuilder sb = new StringBuilder("https://api.guildwars2.com/v2/currencies?ids=");
+            StringBuilder sb = new StringBuilder("https://api.guildwars2.com/v2/currencies?lang=en&ids=");
             boolean first = true;
             for (Integer id : ids) {
                 if (!first)
@@ -229,7 +229,8 @@ public class Gw2PricesDao {
 
             HttpRequest req = HttpRequest.newBuilder(uri).GET().build();
             HttpResponse<String> resp = HTTP.send(req, HttpResponse.BodyHandlers.ofString());
-            if (resp.statusCode() != 200) {
+            int code = resp.statusCode();
+            if (code != 200 && code != 206) {
                 System.err.println("GW2 API currencies failed: HTTP " + resp.statusCode());
                 return Collections.emptyMap();
             }
