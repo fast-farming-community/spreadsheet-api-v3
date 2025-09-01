@@ -11,7 +11,6 @@ import eu.fast.gw2.enums.Tier;
 public final class OverlayTierRunner implements Runnable {
 
     private static final boolean ONLY_REFERENCED_DETAILS = false;
-    private static final int REF_EXPAND_LEVELS = 0;
 
     private final Tier t;
     private final List<Object[]> detailTargets;
@@ -41,43 +40,28 @@ public final class OverlayTierRunner implements Runnable {
         // -------- PREWARM EVs used by MAIN tables (taxes=0 for composite refs)
         Set<String> refKeys = new HashSet<>();
         try {
-            long warmStart = System.currentTimeMillis();
             refKeys = OverlayReferencePlanner.collectCompositeKeysReferencedByMains(mainTargets);
 
             if (!refKeys.isEmpty())
                 OverlayCache.preloadDetailRows(refKeys);
 
             Map<Integer, int[]> tierPrices = OverlayCache.getOrFillPriceCache(Collections.emptySet(), t);
-            int warmed = 0, skipped = 0;
             for (String k : refKeys) {
                 String ck = t.label + "|0|SUM|" + k; // cache key shape with default SUM for warm
                 if (OverlayCache.getEv(ck) != null) {
-                    skipped++;
                     continue;
                 }
                 List<Map<String, Object>> drops = OverlayCache.getBaseDetailRows(k);
                 int[] ev = (drops == null || drops.isEmpty()) ? new int[] { 0, 0 }
                         : OverlayHelper.bagEV(drops, tierPrices, 0);
                 OverlayCache.putEv(ck, ev);
-                warmed++;
             }
-            long warmMs = System.currentTimeMillis() - warmStart;
-            System.out.printf(java.util.Locale.ROOT,
-                    "Overlay TIER %s WARM: detailKeys=%d warmed=%d skipped=%d (%.1fs)%n",
-                    t.name(), refKeys.size(), warmed, skipped, warmMs / 1000.0);
         } catch (Exception e) {
-            System.err.println("Overlay TIER " + t.name() + " WARM: failed -> " + e.getMessage());
+            System.err.println("Overlay " + t.name() + " WARM: failed -> " + e.getMessage());
         }
 
         // -------- Determine which detail tables to recompute --------
         Set<String> allowedDetailKeys = null;
-        if (ONLY_REFERENCED_DETAILS) {
-            allowedDetailKeys = OverlayReferencePlanner.expandCompositeRefs(refKeys, REF_EXPAND_LEVELS);
-            allowedDetailKeys.addAll(refKeys);
-            System.out.printf(java.util.Locale.ROOT,
-                    "Overlay TIER %s DETAIL: filter referenced=%d expand=%d allowed=%d%n",
-                    t.name(), refKeys.size(), REF_EXPAND_LEVELS, allowedDetailKeys.size());
-        }
         final Set<String> allowedDetailKeysCap = allowedDetailKeys;
 
         final int totalDetailPlanned = ONLY_REFERENCED_DETAILS
@@ -89,10 +73,7 @@ public final class OverlayTierRunner implements Runnable {
         final int totalMainPlanned = mainTargets.size();
 
         // -------- DETAIL --------
-        long tierStart = System.currentTimeMillis();
-        int ok = 0, fail = 0, skipped = 0, detailIndex = 0;
-        if (profile)
-            System.out.println("Overlay TIER " + t.name() + " DETAIL: start");
+        int fail = 0, detailIndex = 0;
 
         Map<Integer, int[]> priceMap = OverlayCache.getOrFillPriceCache(Collections.emptySet(), t);
         for (Object[] row : detailTargets) {
@@ -128,34 +109,21 @@ public final class OverlayTierRunner implements Runnable {
                 OverlayHelper.applyAggregation(rows, "SUM");
 
                 writer.enqueueDetail(fid, key, t.label, OverlayJson.toJson(rows));
-                ok++;
             } catch (Exception e) {
                 fail++;
-                System.err.printf("Overlay TIER %s DETAIL: ! fid=%d key='%s' -> %s: %s%n",
+                System.err.printf("Overlay %s DETAIL: ! fid=%d key='%s' -> %s: %s%n",
                         t.name(), fid, key, e.getClass().getSimpleName(),
                         (e.getMessage() == null ? "<no message>" : e.getMessage()));
             }
         }
-        if (ONLY_REFERENCED_DETAILS) {
-            System.out.printf(java.util.Locale.ROOT, "Overlay TIER %s DETAIL: ok=%d skipped=%d fail=%d%n",
-                    t.name(), ok, skipped, fail);
-        } else {
-            System.out.printf(java.util.Locale.ROOT, "Overlay TIER %s DETAIL: ok=%d fail=%d%n", t.name(), ok, fail);
-        }
-        long tierDur = System.currentTimeMillis() - tierStart;
-        System.out.printf(java.util.Locale.ROOT, "Overlay TIER %s DETAIL: finished in %.1fs%n",
-                t.name(), tierDur / 1000.0);
 
         // contribute fail count to run-wide summary
         if (fail > 0)
             run.addFails(fail);
 
         // -------- MAIN --------
-        tierStart = System.currentTimeMillis();
-        ok = fail = 0;
+        fail = 0;
         int mainIndex = 0;
-        if (profile)
-            System.out.println("Overlay TIER " + t.name() + " MAIN: start");
 
         priceMap = OverlayCache.getOrFillPriceCache(Collections.emptySet(), t);
         for (String compositeKey : mainTargets) {
@@ -192,18 +160,13 @@ public final class OverlayTierRunner implements Runnable {
                 OverlayHelper.applyAggregation(rows, "MAX");
 
                 writer.enqueueMain(compositeKey, t.label, OverlayJson.toJson(rows));
-                ok++;
             } catch (Exception e) {
                 fail++;
-                System.err.printf("Overlay TIER %s MAIN: ! key='%s' -> %s: %s%n",
+                System.err.printf("Overlay %s MAIN: ! key='%s' -> %s: %s%n",
                         t.name(), compositeKey, e.getClass().getSimpleName(),
                         (e.getMessage() == null ? "<no message>" : e.getMessage()));
             }
         }
-        System.out.printf(java.util.Locale.ROOT, "Overlay TIER %s MAIN: ok=%d fail=%d%n", t.name(), ok, fail);
-        long tierMain = System.currentTimeMillis() - tierStart;
-        System.out.printf(java.util.Locale.ROOT, "Overlay TIER %s MAIN: finished in %.1fs%n",
-                t.name(), tierMain / 1000.0);
 
         // contribute fail count to run-wide summary
         if (fail > 0)
