@@ -17,26 +17,26 @@ public final class OverlayTierRunner implements Runnable {
     private final List<Object[]> detailTargets;
     private final List<String> mainTargets; // entries are "pageId|name"
     private final OverlayUpsertQueue writer;
-    private final OverlayProblemLog problems;
+    private final OverlayProfiler.Run run;
     private final boolean profile;
 
     public OverlayTierRunner(Tier t,
             List<Object[]> detailTargets,
             List<String> mainTargets,
             OverlayUpsertQueue writer,
-            OverlayProblemLog problems,
+            OverlayProfiler.Run run,
             boolean profile) {
         this.t = t;
         this.detailTargets = detailTargets;
         this.mainTargets = mainTargets;
         this.writer = writer;
-        this.problems = problems;
+        this.run = run;
         this.profile = profile;
     }
 
     @Override
     public void run() {
-        final OverlayProfiler prof = new OverlayProfiler(t.name(), profile);
+        final OverlayProfiler.Tier prof = run.newTier(t.name(), profile);
 
         // -------- PREWARM EVs used by MAIN tables (taxes=0 for composite refs)
         Set<String> refKeys = new HashSet<>();
@@ -122,7 +122,7 @@ public final class OverlayTierRunner implements Runnable {
                 if (profile)
                     prof.tableBegin(key, false, rows.size(), ++detailIndex, Math.max(totalDetailPlanned, 1));
                 for (int i = 0; i < rows.size(); i++)
-                    OverlayRowComputer.computeRow(rows.get(i), ctx, i, prof, problems);
+                    OverlayRowComputer.computeRow(rows.get(i), ctx, i, prof, run);
 
                 // Keep detail TOTAL default as SUM (external manual overrides still allowed).
                 OverlayHelper.applyAggregation(rows, "SUM");
@@ -145,6 +145,10 @@ public final class OverlayTierRunner implements Runnable {
         long tierDur = System.currentTimeMillis() - tierStart;
         System.out.printf(java.util.Locale.ROOT, "Overlay TIER %s DETAIL: finished in %.1fs%n",
                 t.name(), tierDur / 1000.0);
+
+        // contribute fail count to run-wide summary
+        if (fail > 0)
+            run.addFails(fail);
 
         // -------- MAIN --------
         tierStart = System.currentTimeMillis();
@@ -182,7 +186,7 @@ public final class OverlayTierRunner implements Runnable {
                 if (profile)
                     prof.tableBegin(compositeKey, true, rows.size(), ++mainIndex, Math.max(totalMainPlanned, 1));
                 for (int i = 0; i < rows.size(); i++)
-                    OverlayRowComputer.computeRow(rows.get(i), ctx, i, prof, problems);
+                    OverlayRowComputer.computeRow(rows.get(i), ctx, i, prof, run);
 
                 // MAIN (INTERNAL): policy = MAX
                 OverlayHelper.applyAggregation(rows, "MAX");
@@ -201,6 +205,11 @@ public final class OverlayTierRunner implements Runnable {
         System.out.printf(java.util.Locale.ROOT, "Overlay TIER %s MAIN: finished in %.1fs%n",
                 t.name(), tierMain / 1000.0);
 
-        prof.printSummary(t.name());
+        // contribute fail count to run-wide summary
+        if (fail > 0)
+            run.addFails(fail);
+
+        // finalize tier -> push counters into the run
+        prof.finish();
     }
 }

@@ -10,12 +10,12 @@ public class OverlayEngine {
 
     // Public entry: recompute & persist overlays for all tiers
     public static void recomputeAndPersistAllOverlays() {
-        final long runStartMs = System.currentTimeMillis();
         final boolean PROFILE = true;
         final int TIER_THREADS = 3;
         final Tier[] TIERS = { Tier.T2M, Tier.T10M, Tier.T60M };
 
-        OverlayProblemLog problems = new OverlayProblemLog();
+        // single run profiler (aggregates tiers + problem log)
+        OverlayProfiler.Run run = new OverlayProfiler.Run();
 
         // writer with batching & in-queue de-dupe (own thread)
         try (OverlayUpsertQueue writer = OverlayUpsertQueue.startDefault()) {
@@ -31,7 +31,7 @@ public class OverlayEngine {
                             plan.detailTargets(),
                             plan.mainTargets(),
                             writer,
-                            problems,
+                            run,
                             PROFILE));
                 }
             } finally {
@@ -44,9 +44,7 @@ public class OverlayEngine {
             }
         }
 
-        System.out.printf(java.util.Locale.ROOT,
-                "Overlay RUN: finished in %.1fs%n",
-                (System.currentTimeMillis() - runStartMs) / 1000.0);
-        problems.printSummary();
+        // One combined line + problems (only if any)
+        run.printRunSummaryAndProblems();
     }
 }

@@ -44,7 +44,7 @@ public final class OverlayRowComputer {
     }
 
     static void computeRow(Map<String, Object> row, ComputeContext ctx, int rowIndex,
-            OverlayProfiler prof, OverlayProblemLog problems) {
+            OverlayProfiler.Tier prof, OverlayProfiler.Run run) {
 
         String rawCategory = OverlayHelper.str(row.get(OverlayHelper.COL_CAT));
         String rawKey = OverlayHelper.str(row.get(OverlayHelper.COL_KEY));
@@ -229,8 +229,8 @@ public final class OverlayRowComputer {
             else
                 OverlayHelper.writeFour(row, 0, 0, 0, 0);
             writeSpiritShardAugments(row, ctx);
-            if (problems != null)
-                problems.record(ctx.isMain, ctx.tableKey, ctx.detailFeatureIdOrNull, rowIndex, row, taxesPct,
+            if (run != null)
+                run.recordProblem(ctx.isMain, ctx.tableKey, ctx.detailFeatureIdOrNull, rowIndex, row, taxesPct,
                         "missing_formulas");
             return;
         }
@@ -263,8 +263,8 @@ public final class OverlayRowComputer {
             OverlayHelper.writeFour(row, IB_TPB, IS_TPB, IB_TPS, IS_TPS);
 
         writeSpiritShardAugments(row, ctx);
-        if (problems != null)
-            problems.recordIfZero(ctx.isMain, ctx.tableKey, ctx.detailFeatureIdOrNull, rowIndex, row, taxesPct,
+        if (run != null)
+            run.recordProblemIfZero(ctx.isMain, ctx.tableKey, ctx.detailFeatureIdOrNull, rowIndex, row, taxesPct,
                     "computed_zero");
     }
 
