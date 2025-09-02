@@ -217,7 +217,7 @@ public class Gw2PricesDao {
 
         try {
             // Build query string: e.g. ids=1,2,3
-            StringBuilder sb = new StringBuilder("https://api.guildwars2.com/v2/currencies?lang=en&ids=");
+            StringBuilder sb = new StringBuilder("https://api.guildwars2.com/v2/currencies?ids=");
             boolean first = true;
             for (Integer id : ids) {
                 if (!first)
